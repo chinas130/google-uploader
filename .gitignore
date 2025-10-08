@@ -1,0 +1,8 @@
+basedir/
+config.json
+client_secret.json
+vendor/
+.cursorignore
+.env
+token.json
+.DS_Store
