@@ -150,6 +150,8 @@ class Pipeline {
             $preparedDir = $this->baseDir . "/LeadSwift_PREPARED/campaign_{$campId}";
             foreach ([$rawDir,$mergedDir,$preparedDir] as $d) { if (!is_dir($d)) mkdir($d, 0777, true); }
 
+            $campaignDownloaded = [];
+
             // 1) GET searches of campaign
             $searchesUrl = "https://leadswift.com/api/searches/{$campId}?api_key=" . urlencode($this->config['api_key'] ?? '');
             $this->logger->debug("Fetching searches: {$searchesUrl}");
@@ -237,71 +239,167 @@ class Pipeline {
                 $this->logger->info("Downloading -> {$destPath}");
                 $csv = Utils::httpGet($downloadUrl);
                 file_put_contents($destPath, $csv);
+                $campaignDownloaded[] = $destPath;
                 $downloaded[] = $destPath;
             }
 
-            // Merge
-            $mergePath = $this->nextSeqPath($mergedDir, 'merge', 'csv');
-            $out = fopen($mergePath, 'w');
-            $headerWritten = false;
-            foreach ($downloaded as $f) {
-                if (!is_readable($f)) continue;
-                $h = fopen($f,'r'); if ($h === false) continue;
-                $i = 0;
-                while (($row = fgetcsv($h)) !== false) {
-                    $i++;
-                    if ($i === 1) {
-                        if (!$headerWritten) { fputcsv($out, $row); $headerWritten = true; }
-                        continue;
-                    }
-                    fputcsv($out, $row);
-                }
-                fclose($h);
+            if (!count($campaignDownloaded)) {
+                $this->logger->info("No new downloads for campaign {$campId}");
+                continue;
             }
-            fclose($out);
-            $this->logger->info("Merged: {$mergePath}");
 
-            // Prepare
-            $preparedPath = $this->nextSeqPath($preparedDir, 'prepared', 'csv');
-            $in = fopen($mergePath, 'r'); if ($in === false) continue;
-            $out = fopen($preparedPath, 'w'); if ($out === false) { fclose($in); continue; }
-            $header = fgetcsv($in);
-            if ($header === false) { fclose($in); fclose($out); continue; }
-            $map = array_change_key_case(array_flip($header), CASE_LOWER);
-            $idxCompany = $map['company'] ?? $map['company_name'] ?? $map['business_name'] ?? $map['organization'] ?? $map['org'] ?? $map['name'] ?? -1;
-            $idxEmail   = $map['email'] ?? $map['email_address'] ?? $map['contact_email'] ?? $map['primary_email'] ?? -1;
-            $idxPhone   = $map['phone'] ?? $map['phone_number'] ?? $map['contact_phone'] ?? $map['primary_phone'] ?? $map['telephone'] ?? $map['mobile'] ?? -1;
-            $byCompany = [];
-            while (($row = fgetcsv($in)) !== false) {
-                $company = $idxCompany >= 0 ? trim((string)($row[$idxCompany] ?? '')) : '';
-                if ($company === '') $company = 'UNKNOWN';
-                $email = $idxEmail >= 0 ? trim((string)($row[$idxEmail] ?? '')) : '';
-                $phone = $idxPhone >= 0 ? trim((string)($row[$idxPhone] ?? '')) : '';
-                if (!isset($byCompany[$company])) $byCompany[$company] = ['phone'=>'','emails'=>[], 'seen'=>[]];
-                if ($byCompany[$company]['phone'] === '' && $phone !== '') {
-                    $byCompany[$company]['phone'] = preg_replace('/[^+0-9]/','',$phone);
-                }
-                if ($email !== '') {
-                    $k = strtolower($email);
-                    if (!isset($byCompany[$company]['seen'][$k])) { $byCompany[$company]['seen'][$k] = 1; $byCompany[$company]['emails'][] = $email; }
-                }
+            $mergePath = $this->mergeSourceFiles($campaignDownloaded, $mergedDir, 'merge');
+            if ($mergePath === null) {
+                $this->logger->warn("Merge skipped for campaign {$campId} — no readable CSV files");
+                continue;
             }
-            fclose($in);
-            fputcsv($out, ['Company','Contact Label','Email','Phone']);
-            foreach ($byCompany as $company => $info) {
-                if (empty($info['emails'])) continue;
-                foreach ($info['emails'] as $i => $email) {
-                    $label = ($i === 0) ? 'contact 1' : 'contact 2';
-                    fputcsv($out, [$company, $label, $email, $info['phone']]);
-                }
+
+            $preparedPath = $this->buildPreparedFromMerge($mergePath, $preparedDir, 'prepared');
+            if ($preparedPath === null) {
+                $this->logger->warn("Prepared CSV skipped for campaign {$campId} — unable to parse merge result");
+                continue;
             }
-            fclose($out);
             $this->logger->info("Prepared: {$preparedPath}");
 
             $exportedIds[] = $campId;
             $this->logger->info("Campaign processed: {$campId}");
         }
         return ['downloaded' => $downloaded, 'exported_ids' => $exportedIds];
+    }
+
+    private function mergeSourceFiles(array $sourceFiles, string $targetDir, string $prefix): ?string {
+        $valid = array_values(array_filter($sourceFiles, fn($file) => is_string($file) && is_readable($file)));
+        if (!count($valid)) return null;
+
+        natsort($valid);
+        $valid = array_values($valid);
+
+        $mergePath = $this->nextSeqPath($targetDir, $prefix, 'csv');
+        $out = fopen($mergePath, 'w');
+        if ($out === false) return null;
+
+        $headerWritten = false;
+        foreach ($valid as $file) {
+            $handle = fopen($file, 'r');
+            if ($handle === false) continue;
+            $rowIndex = 0;
+            while (($row = fgetcsv($handle)) !== false) {
+                $rowIndex++;
+                if ($rowIndex === 1) {
+                    if (!$headerWritten) {
+                        fputcsv($out, $row);
+                        $headerWritten = true;
+                    }
+                    continue;
+                }
+                fputcsv($out, $row);
+            }
+            fclose($handle);
+        }
+        fclose($out);
+        $this->logger->info("Merged: {$mergePath}");
+        return $mergePath;
+    }
+
+    private function buildPreparedFromMerge(string $mergePath, string $preparedDir, string $prefix): ?string {
+        $in = fopen($mergePath, 'r');
+        if ($in === false) return null;
+
+        $preparedPath = $this->nextSeqPath($preparedDir, $prefix, 'csv');
+        $out = fopen($preparedPath, 'w');
+        if ($out === false) {
+            fclose($in);
+            return null;
+        }
+
+        $header = fgetcsv($in);
+        if ($header === false) {
+            fclose($in);
+            fclose($out);
+            unlink($preparedPath);
+            return null;
+        }
+
+        $map = array_change_key_case(array_flip($header), CASE_LOWER);
+        $idxCompany = $map['company'] ?? $map['company_name'] ?? $map['business_name'] ?? $map['organization'] ?? $map['org'] ?? $map['name'] ?? -1;
+        $idxEmail   = $map['email'] ?? $map['email_address'] ?? $map['contact_email'] ?? $map['primary_email'] ?? -1;
+        $idxPhone   = $map['phone'] ?? $map['phone_number'] ?? $map['contact_phone'] ?? $map['primary_phone'] ?? $map['telephone'] ?? $map['mobile'] ?? -1;
+
+        $byCompany = [];
+        while (($row = fgetcsv($in)) !== false) {
+            $company = $idxCompany >= 0 ? trim((string)($row[$idxCompany] ?? '')) : '';
+            if ($company === '') $company = 'UNKNOWN';
+            $email = $idxEmail >= 0 ? trim((string)($row[$idxEmail] ?? '')) : '';
+            $phone = $idxPhone >= 0 ? trim((string)($row[$idxPhone] ?? '')) : '';
+            if (!isset($byCompany[$company])) $byCompany[$company] = ['phone'=>'','emails'=>[], 'seen'=>[]];
+            if ($byCompany[$company]['phone'] === '' && $phone !== '') {
+                $byCompany[$company]['phone'] = preg_replace('/[^+0-9]/','',$phone);
+            }
+            if ($email !== '') {
+                $k = strtolower($email);
+                if (!isset($byCompany[$company]['seen'][$k])) {
+                    $byCompany[$company]['seen'][$k] = 1;
+                    $byCompany[$company]['emails'][] = $email;
+                }
+            }
+        }
+        fclose($in);
+
+        fputcsv($out, ['Company','Contact Label','Email','Phone']);
+        foreach ($byCompany as $company => $info) {
+            if (empty($info['emails'])) continue;
+            foreach ($info['emails'] as $i => $email) {
+                $label = 'contact ' . ($i + 1);
+                fputcsv($out, [$company, $label, $email, $info['phone']]);
+            }
+        }
+        fclose($out);
+        return $preparedPath;
+    }
+
+    public function repairCampaignsFromRaw(array $campaignIds, bool $cleanExisting = true): array {
+        $rebuilt = [];
+        foreach ($campaignIds as $campId) {
+            if ($campId === null || $campId === '') continue;
+            $campId = (string)$campId;
+            $rawDir      = $this->baseDir . "/LeadSwift_RAW/campaign_{$campId}";
+            $mergedDir   = $this->baseDir . "/LeadSwift_MERGED/campaign_{$campId}";
+            $preparedDir = $this->baseDir . "/LeadSwift_PREPARED/campaign_{$campId}";
+
+            if (!is_dir($rawDir)) {
+                $this->logger->warn("Repair skipped for campaign {$campId} — RAW directory missing");
+                continue;
+            }
+
+            foreach ([$mergedDir,$preparedDir] as $dir) {
+                if (!is_dir($dir)) mkdir($dir, 0777, true);
+                if ($cleanExisting) {
+                    foreach (glob($dir . '/*.csv') ?: [] as $file) {
+                        @unlink($file);
+                    }
+                }
+            }
+
+            $rawFiles = glob($rawDir . '/*.csv') ?: [];
+            if (!count($rawFiles)) {
+                $this->logger->warn("Repair skipped for campaign {$campId} — no RAW CSV files found");
+                continue;
+            }
+
+            $mergePath = $this->mergeSourceFiles($rawFiles, $mergedDir, 'merge_repair');
+            if ($mergePath === null) continue;
+
+            $preparedPath = $this->buildPreparedFromMerge($mergePath, $preparedDir, 'prepared_repair');
+            if ($preparedPath === null) continue;
+
+            $rebuilt[$campId] = [
+                'raw_files' => count($rawFiles),
+                'merge' => $mergePath,
+                'prepared' => $preparedPath,
+            ];
+            $this->logger->info("Repair completed for campaign {$campId}");
+        }
+        return $rebuilt;
     }
 
     private function nextSeqPath(string $dir, string $prefix, string $ext): string {
@@ -313,5 +411,3 @@ class Pipeline {
         Utils::atomicWrite($path, json_encode($this->config, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));
     }
 }
-
-

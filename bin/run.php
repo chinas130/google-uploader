@@ -78,7 +78,26 @@ function uploadPreparedWeekFiles(DriveUploader $uploader, string $baseDir): void
     }
 }
 
-$opts = getopt('', ['config::','env::','daily-start','weekly-start','no_progress','upload-to-drive::','drive-token::','drive-creds::','only-upload']);
+function uploadPreparedArtifacts(DriveUploader $uploader, string $baseDir, array $campaignIds): void
+{
+    foreach ($campaignIds as $campId) {
+        if ($campId === null || $campId === '') continue;
+        $campId = trim((string)$campId);
+        if ($campId === '') continue;
+        $dir = $baseDir . "/LeadSwift_PREPARED/campaign_{$campId}";
+        if (!is_dir($dir)) continue;
+        $results = $uploader->uploadDirectoryPreserve($dir, "LeadSwift_PREPARED/campaign_{$campId}");
+        foreach ($results as $local => $id) {
+            if ($id) {
+                echo "Uploaded {$local} -> {$id}\n";
+            } else {
+                fwrite(STDERR, "Upload failed for {$local}\n");
+            }
+        }
+    }
+}
+
+$opts = getopt('', ['config::','env::','daily-start','weekly-start','no_progress','upload-to-drive::','drive-token::','drive-creds::','only-upload','repair-csv','repair-csv-no-upload']);
 
 function discoverCampaignIds(string $baseDir, array $config): array
 {
@@ -117,20 +136,41 @@ function discoverCampaignIds(string $baseDir, array $config): array
     return $candidates;
 }
 
+$repairMode = isset($opts['repair-csv']);
+$repairNoUpload = isset($opts['repair-csv-no-upload']);
+if ($repairNoUpload && !$repairMode) {
+    fwrite(STDERR, "--repair-csv-no-upload can only be used together with --repair-csv\n");
+    exit(1);
+}
+
 $configPath = $opts['config'] ?? __DIR__ . '/../config.json';
 $envPath = $opts['env'] ?? null;
 $env = Utils::loadEnvFile($envPath);
 
-if (!is_readable($configPath)) {
+$config = [];
+if (is_readable($configPath)) {
+    $decoded = json_decode(file_get_contents($configPath), true);
+    if ($decoded === null && json_last_error() !== JSON_ERROR_NONE) {
+        fwrite(STDERR, "Invalid config.json\n");
+        exit(1);
+    }
+    if (is_array($decoded)) {
+        $config = $decoded;
+    }
+} elseif (!$repairMode) {
     fwrite(STDERR, "Config not found: {$configPath}\n");
     exit(1);
 }
-$config = json_decode(file_get_contents($configPath), true);
-if ($config === null) { fwrite(STDERR, "Invalid config.json\n"); exit(1); }
 
-$baseDir = $config['base_dir'] ?? getcwd();
+$defaultBaseDir = realpath(__DIR__ . '/../basedir') ?: getcwd();
+$baseDir = $config['base_dir'] ?? $defaultBaseDir;
 $onlyUpload = isset($opts['only-upload']);
 $uploadRequested = isset($opts['upload-to-drive']) || $onlyUpload;
+
+if ($repairMode && ($onlyUpload || isset($opts['daily-start']) || isset($opts['weekly-start']))) {
+    fwrite(STDERR, "--repair-csv cannot be combined with daily/weekly pipeline flags or --only-upload\n");
+    exit(1);
+}
 
 if ($onlyUpload && (isset($opts['daily-start']) || isset($opts['weekly-start']))) {
     fwrite(STDERR, "--only-upload cannot be combined with daily or weekly pipeline flags\n");
@@ -140,6 +180,30 @@ if ($onlyUpload && (isset($opts['daily-start']) || isset($opts['weekly-start']))
 $pipeline = new Pipeline($config, $baseDir);
 
 try {
+    if ($repairMode) {
+        $campaignsForRepair = discoverCampaignIds($baseDir, $config);
+        if (!count($campaignsForRepair)) {
+            fwrite(STDERR, "No campaigns discovered for repair\n");
+        } else {
+            $rebuilt = $pipeline->repairCampaignsFromRaw($campaignsForRepair);
+            if (!count($rebuilt)) {
+                fwrite(STDERR, "Repair command completed but no CSV files were rebuilt\n");
+            }
+        }
+
+        if (!$repairNoUpload && !empty($rebuilt ?? [])) {
+            $uploader = buildDriveUploader($opts);
+            foreach (array_keys($rebuilt) as $campId) {
+                $uploader->purgeRemotePrefix("LeadSwift_PREPARED/campaign_{$campId}");
+            }
+            $uploader->purgeRemotePrefix('LeadSwift_PREPARED_WEEK');
+            uploadPreparedArtifacts($uploader, $baseDir, array_keys($rebuilt));
+            uploadPreparedWeekDirectory($uploader, $baseDir);
+            uploadPreparedWeekFiles($uploader, $baseDir);
+        }
+        exit(0);
+    }
+
     if ($onlyUpload) {
         $uploader = buildDriveUploader($opts);
         $campaignsForUpload = discoverCampaignIds($baseDir, $config);

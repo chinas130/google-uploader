@@ -156,4 +156,74 @@ class DriveUploader {
         if (!$files) return null;
         return $files[0]->getId();
     }
+
+    public function purgeRemotePrefix(string $remotePrefix): void
+    {
+        $normalized = str_replace('\\', '/', $remotePrefix);
+        $normalized = trim($normalized, '/');
+        if ($normalized === '') return;
+        $segments = array_values(array_filter(
+            explode('/', $normalized),
+            fn($seg) => $seg !== '' && $seg !== '.' && $seg !== '..'
+        ));
+        if (!count($segments)) return;
+        $folderId = $this->locateFolderChain($segments, null);
+        if ($folderId === null) return;
+        $this->deleteFolderContents($folderId, false);
+    }
+
+    private function locateFolderChain(array $segments, ?string $parentId = null): ?string
+    {
+        $currentParent = $parentId;
+        foreach ($segments as $segment) {
+            $segment = trim($segment);
+            if ($segment === '' || $segment === '.' || $segment === '..') continue;
+            $folderId = $this->findFolder($segment, $currentParent);
+            if ($folderId === null) return null;
+            $currentParent = $folderId;
+        }
+        return $currentParent;
+    }
+
+    private function deleteFolderContents(string $folderId, bool $deleteSelf): void
+    {
+        $pageToken = null;
+        do {
+            $params = [
+                'q' => sprintf("'%s' in parents and trashed = false", $folderId),
+                'spaces' => 'drive',
+                'fields' => 'nextPageToken, files(id, mimeType)',
+                'pageSize' => 1000,
+            ];
+            if ($pageToken !== null) {
+                $params['pageToken'] = $pageToken;
+            }
+            $response = $this->drive->files->listFiles($params);
+            $files = $response->getFiles();
+            if ($files) {
+                foreach ($files as $file) {
+                    $childId = $file->getId();
+                    $mime = $file->getMimeType();
+                    try {
+                        if ($mime === 'application/vnd.google-apps.folder') {
+                            $this->deleteFolderContents($childId, true);
+                        } else {
+                            $this->drive->files->delete($childId);
+                        }
+                    } catch (\Exception $e) {
+                        fwrite(STDERR, "Failed to delete remote item {$childId}: " . $e->getMessage() . "\n");
+                    }
+                }
+            }
+            $pageToken = $response->getNextPageToken();
+        } while ($pageToken);
+
+        if ($deleteSelf) {
+            try {
+                $this->drive->files->delete($folderId);
+            } catch (\Exception $e) {
+                fwrite(STDERR, "Failed to delete remote folder {$folderId}: " . $e->getMessage() . "\n");
+            }
+        }
+    }
 }
