@@ -49,35 +49,6 @@ function uploadCampaignArtifacts(DriveUploader $uploader, string $baseDir, array
     }
 }
 
-function uploadPreparedWeekDirectory(DriveUploader $uploader, string $baseDir): void
-{
-    $pw = $baseDir . '/LeadSwift_PREPARED_WEEK';
-    if (!is_dir($pw)) return;
-    $results = $uploader->uploadDirectoryPreserve($pw, 'LeadSwift_PREPARED_WEEK');
-    foreach ($results as $local => $id) {
-        if ($id) {
-            echo "Uploaded {$local} -> {$id}\n";
-        } else {
-            fwrite(STDERR, "Upload failed for {$local}\n");
-        }
-    }
-}
-
-function uploadPreparedWeekFiles(DriveUploader $uploader, string $baseDir): void
-{
-    $preparedWeekDir = $baseDir . '/LeadSwift_PREPARED_WEEK';
-    if (!is_dir($preparedWeekDir)) return;
-    foreach (glob($preparedWeekDir . '/*.csv') as $file) {
-        if (!is_readable($file)) {
-            fwrite(STDERR, "Cannot read {$file}\n");
-            continue;
-        }
-        $remotePath = 'LeadSwift_PREPARED_WEEK/' . basename($file);
-        $id = $uploader->uploadFileFromPath($file, $remotePath);
-        echo "Uploaded {$file} -> {$id}\n";
-    }
-}
-
 function uploadPreparedArtifacts(DriveUploader $uploader, string $baseDir, array $campaignIds): void
 {
     foreach ($campaignIds as $campId) {
@@ -97,12 +68,12 @@ function uploadPreparedArtifacts(DriveUploader $uploader, string $baseDir, array
     }
 }
 
-$opts = getopt('', ['config::','env::','daily-start','weekly-start','no_progress','upload-to-drive::','drive-token::','drive-creds::','only-upload','repair-csv','repair-csv-no-upload']);
+$opts = getopt('', ['config::','env::','daily-start','no_progress','upload-to-drive::','drive-token::','drive-creds::','only-upload','repair-csv','repair-csv-no-upload']);
 
 function discoverCampaignIds(string $baseDir, array $config): array
 {
     $candidates = [];
-    foreach (['campaigns_unexported', 'campaigns_exported_week', 'campaigns_exported_all'] as $key) {
+    foreach (['campaigns_unexported', 'campaigns_queued', 'campaigns_exported_all'] as $key) {
         if (!empty($config[$key]) && is_array($config[$key])) {
             foreach ($config[$key] as $val) {
                 if ($val === null || $val === '') continue;
@@ -167,13 +138,13 @@ $baseDir = $config['base_dir'] ?? $defaultBaseDir;
 $onlyUpload = isset($opts['only-upload']);
 $uploadRequested = isset($opts['upload-to-drive']) || $onlyUpload;
 
-if ($repairMode && ($onlyUpload || isset($opts['daily-start']) || isset($opts['weekly-start']))) {
-    fwrite(STDERR, "--repair-csv cannot be combined with daily/weekly pipeline flags or --only-upload\n");
+if ($repairMode && ($onlyUpload || isset($opts['daily-start']))) {
+    fwrite(STDERR, "--repair-csv cannot be combined with daily pipeline flag or --only-upload\n");
     exit(1);
 }
 
-if ($onlyUpload && (isset($opts['daily-start']) || isset($opts['weekly-start']))) {
-    fwrite(STDERR, "--only-upload cannot be combined with daily or weekly pipeline flags\n");
+if ($onlyUpload && isset($opts['daily-start'])) {
+    fwrite(STDERR, "--only-upload cannot be combined with daily pipeline flag\n");
     exit(1);
 }
 
@@ -196,10 +167,7 @@ try {
             foreach (array_keys($rebuilt) as $campId) {
                 $uploader->purgeRemotePrefix("LeadSwift_PREPARED/campaign_{$campId}");
             }
-            $uploader->purgeRemotePrefix('LeadSwift_PREPARED_WEEK');
             uploadPreparedArtifacts($uploader, $baseDir, array_keys($rebuilt));
-            uploadPreparedWeekDirectory($uploader, $baseDir);
-            uploadPreparedWeekFiles($uploader, $baseDir);
         }
         exit(0);
     }
@@ -208,8 +176,6 @@ try {
         $uploader = buildDriveUploader($opts);
         $campaignsForUpload = discoverCampaignIds($baseDir, $config);
         uploadCampaignArtifacts($uploader, $baseDir, $campaignsForUpload);
-        uploadPreparedWeekDirectory($uploader, $baseDir);
-        uploadPreparedWeekFiles($uploader, $baseDir);
         exit(0);
     }
 
@@ -223,18 +189,7 @@ try {
             $uploader = buildDriveUploader($opts);
             $exported = $res['exported_ids'] ?? [];
             uploadCampaignArtifacts($uploader, $baseDir, $exported);
-            uploadPreparedWeekDirectory($uploader, $baseDir);
         }
-    }
-    if (isset($opts['weekly-start'])) {
-        $res = $pipeline->runWeekly();
-        $pipeline->saveConfig($configPath);
-        echo "Weekly run finished: " . ($res['weekly_file'] ?? '') . "\n";
-    }
-
-    if ($uploadRequested) {
-        $uploader = buildDriveUploader($opts);
-        uploadPreparedWeekFiles($uploader, $baseDir);
     }
 } catch (Exception $e) {
     fwrite(STDERR, "Error: " . $e->getMessage() . "\n");

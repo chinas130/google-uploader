@@ -16,52 +16,95 @@ class Pipeline {
         $this->baseDir = rtrim($baseDir, DIRECTORY_SEPARATOR);
         $logDir = $this->baseDir . '/logs';
         if (!is_dir($logDir)) mkdir($logDir, 0777, true);
-        $this->logFile = $logDir . '/lead_swift_' . date('Y-m-d') . '.log';
+        $this->logFile = $logDir . '/lead_swift_' . date('Y-m-d_H-i-s') . '.log';
         $this->logger = new Logger($this->logFile, $this->config['log_level'] ?? 'INFO');
     }
 
-    private function discoverCampaigns(): void {
+    private function syncCampaignQueues(): void {
         $kw = $this->config['campaign_keyword'] ?? null;
-        if (!$kw) return;
-        $url = "https://leadswift.com/api/campaigns?api_key=" . urlencode($this->config['api_key'] ?? '');
-        $resp = Utils::httpGet($url);
+        $apiKey = $this->config['api_key'] ?? null;
+        if (!$kw || !$apiKey) return;
+
+        $url = "https://leadswift.com/api/campaigns?api_key=" . urlencode($apiKey);
+        try {
+            $resp = Utils::httpGet($url);
+        } catch (\Exception $e) {
+            $this->logger->warn('Campaign discovery failed: ' . $e->getMessage());
+            return;
+        }
+
         $json = json_decode($resp, true);
+        if ($json === null && json_last_error() !== JSON_ERROR_NONE) {
+            $this->logger->warn('Campaign discovery returned invalid JSON');
+            return;
+        }
+
         $all = $json['data'] ?? $json;
-        $found = [];
+        if (!is_array($all)) {
+            $this->logger->warn('Campaign discovery response missing data array');
+            return;
+        }
+
+        $matched = [];
         foreach ($all as $c) {
             $name = strtolower($c['name'] ?? $c['title'] ?? '');
             if ($name === '') continue;
             if (stripos($name, strtolower($kw)) !== false) {
-                $found[] = $c['id'] ?? $c['campaign_id'] ?? null;
+                $id = $c['id'] ?? $c['campaign_id'] ?? null;
+                if ($id !== null && $id !== '') {
+                    $matched[] = (string)$id;
+                }
             }
         }
-        $found = array_values(array_filter($found));
-        if (!count($found)) { $this->config['campaigns_all'] = []; return; }
+        $matched = array_values(array_unique($matched));
 
-        // Filter out campaigns that are already exported or already queued
-        $exportedAll = $this->config['campaigns_exported_all'] ?? [];
-        $exportedWeek = $this->config['campaigns_exported_week'] ?? [];
-        $unexported = $this->config['campaigns_unexported'] ?? [];
+        $queued     = array_map('strval', $this->config['campaigns_queued'] ?? []);
+        $unexported = array_map('strval', $this->config['campaigns_unexported'] ?? []);
+        $exported   = array_map('strval', $this->config['campaigns_exported_all'] ?? []);
 
-        $exclude = array_values(array_merge((array)$exportedAll, (array)$exportedWeek, (array)$unexported));
-        $exclude = array_filter($exclude, fn($v) => $v !== null && $v !== '');
+        foreach ($matched as $id) {
+            if (in_array($id, $exported, true)) continue;
+            if (in_array($id, $unexported, true)) continue;
+            if (!in_array($id, $queued, true)) {
+                $queued[] = $id;
+            }
+        }
+        $queued = array_values(array_unique(array_filter($queued, fn($v) => $v !== '')));
 
-        $filtered = array_values(array_filter(array_diff($found, $exclude)));
-        // write only new campaigns into campaigns_all
-        $this->config['campaigns_all'] = $filtered;
+        $quota = max(1, (int)($this->config['search_quota'] ?? 20));
+        $ready = [];
+        $stillQueued = [];
+        foreach ($queued as $campId) {
+            try {
+                $count = $this->fetchCampaignSearchCount($campId);
+            } catch (\Exception $e) {
+                $this->logger->warn("Failed to inspect campaign {$campId}: " . $e->getMessage());
+                $stillQueued[] = $campId;
+                continue;
+            }
+
+            if ($count >= $quota) {
+                $ready[] = $campId;
+            } else {
+                $stillQueued[] = $campId;
+            }
+        }
+
+        $unexported = array_values(array_unique(array_merge($unexported, $ready)));
+        $this->config['campaigns_unexported'] = $unexported;
+        $this->config['campaigns_queued'] = $stillQueued;
+        $this->logger->info(sprintf(
+            'Queue sync result: matched=%d ready=%d queued=%d',
+            count($matched),
+            count($ready),
+            count($stillQueued)
+        ));
     }
 
     public function runDaily(bool $noProgress = false): array {
         $this->logger->info("Starting daily run");
-        // Discover campaigns by keyword and update config
-        try {
-            $this->discoverCampaigns();
-            $this->logger->info('Discovered campaigns: ' . json_encode($this->config['campaigns_all'] ?? []));
-            // merge discovered into unexported queue
-            $this->config['campaigns_unexported'] = array_values(array_unique(array_merge($this->config['campaigns_unexported'] ?? [], $this->config['campaigns_all'] ?? [])));
-        } catch (\Exception $e) {
-            $this->logger->warn('Discovery failed: ' . $e->getMessage());
-        }
+        // Discover campaigns by keyword and update queues
+        $this->syncCampaignQueues();
         // create lock
         $lock = $this->baseDir . '/export.lock';
         if (file_exists($lock)) {
@@ -76,67 +119,22 @@ class Pipeline {
             $toProcess = $batchSize > 0 ? array_slice($unexported, 0, $batchSize) : $unexported;
             $this->logger->info('Processing campaigns: ' . json_encode($toProcess));
             $downloaded = $this->processCampaigns($toProcess, $noProgress);
-            // move exported to weekly
-            $exported = $this->config['campaigns_exported_week'] ?? [];
-            foreach ($downloaded['exported_ids'] as $id) {
+            // remove from unexported
+            $processed = $downloaded['exported_ids'];
+            $this->config['campaigns_unexported'] = array_values(array_diff($this->config['campaigns_unexported'] ?? [], $processed));
+            $this->config['campaigns_queued'] = array_values(array_diff($this->config['campaigns_queued'] ?? [], $processed));
+
+            $exported = $this->config['campaigns_exported_all'] ?? [];
+            foreach ($processed as $id) {
                 if (!in_array($id, $exported, true)) $exported[] = $id;
             }
-            $this->config['campaigns_exported_week'] = array_values($exported);
-            // remove from unexported
-            $this->config['campaigns_unexported'] = array_values(array_diff($this->config['campaigns_unexported'] ?? [], $downloaded['exported_ids']));
+            $this->config['campaigns_exported_all'] = array_values($exported);
 
             $this->logger->info("Daily run finished: RAW=" . count($downloaded['downloaded']) . "; EXPORTED_IDS=" . json_encode($downloaded['exported_ids']));
             return $downloaded;
         } finally {
             if (file_exists($lock)) unlink($lock);
         }
-    }
-
-    public function runWeekly(): array {
-        $lock = $this->baseDir . '/export.lock';
-        // wait for daily to finish (no global timeout)
-        while (file_exists($lock)) {
-            sleep(5);
-        }
-
-        $this->logger->info("Starting weekly run");
-        $weekly = $this->config['campaigns_exported_week'] ?? [];
-        $preparedWeekDir = $this->baseDir . '/LeadSwift_PREPARED_WEEK';
-        if (!is_dir($preparedWeekDir)) mkdir($preparedWeekDir, 0777, true);
-
-        $dateName = date('Y-m-d') . '.csv';
-        $outPath = $preparedWeekDir . DIRECTORY_SEPARATOR . $dateName;
-        $out = fopen($outPath, 'w');
-        if ($out === false) throw new \Exception('Cannot open weekly prepared file');
-
-        $mergedAny = false;
-        // collect prepared CSVs from campaigns_exported_week
-        foreach ($weekly as $campId) {
-            $preparedDir = $this->baseDir . "/LeadSwift_PREPARED/campaign_{$campId}";
-            if (!is_dir($preparedDir)) continue;
-            foreach (glob($preparedDir . '/*.csv') as $f) {
-                $h = fopen($f, 'r'); if ($h === false) continue;
-                // skip header for subsequent files
-                $i = 0;
-                while (($row = fgetcsv($h)) !== false) {
-                    $i++;
-                    if ($i === 1 && $mergedAny) continue;
-                    fputcsv($out, $row);
-                    $mergedAny = true;
-                }
-                fclose($h);
-            }
-        }
-        fclose($out);
-
-        // move weekly ids to all
-        $all = $this->config['campaigns_exported_all'] ?? [];
-        foreach ($weekly as $id) if (!in_array($id, $all, true)) $all[] = $id;
-        $this->config['campaigns_exported_all'] = array_values($all);
-        $this->config['campaigns_exported_week'] = [];
-
-        $this->logger->info("Weekly aggregated file: {$outPath}");
-        return ['weekly_file' => $outPath, 'ids' => $weekly];
     }
 
     private function processCampaigns(array $campaignIds, bool $noProgress): array {
@@ -265,6 +263,23 @@ class Pipeline {
             $this->logger->info("Campaign processed: {$campId}");
         }
         return ['downloaded' => $downloaded, 'exported_ids' => $exportedIds];
+    }
+
+    private function fetchCampaignSearchCount(string $campaignId): int {
+        $url = "https://leadswift.com/api/searches/{$campaignId}?api_key=" . urlencode($this->config['api_key'] ?? '');
+        $resp = Utils::httpGet($url);
+        $json = json_decode($resp, true);
+        if ($json === null && json_last_error() !== JSON_ERROR_NONE) {
+            throw new \Exception('Invalid JSON from searches endpoint');
+        }
+        if (isset($json['success']) && $json['success'] === false) {
+            $msg = $json['data'] ?? ($json['message'] ?? 'Unknown error');
+            if (is_array($msg)) $msg = json_encode($msg);
+            throw new \Exception((string)$msg);
+        }
+        $data = $json['data'] ?? $json;
+        if (!is_array($data)) return 0;
+        return count($data);
     }
 
     private function mergeSourceFiles(array $sourceFiles, string $targetDir, string $prefix): ?string {
