@@ -5,6 +5,8 @@ require __DIR__ . '/../vendor/autoload.php';
 use App\LeadSwift\Pipeline;
 use App\LeadSwift\Utils;
 use App\Google\DriveUploader;
+use App\Google\CitySheetManager;
+use App\LeadSwift\CitySchedule;
 
 function buildDriveUploader(array $opts): DriveUploader
 {
@@ -68,7 +70,35 @@ function uploadPreparedArtifacts(DriveUploader $uploader, string $baseDir, array
     }
 }
 
-$opts = getopt('', ['config::','env::','daily-start','no_progress','upload-to-drive::','drive-token::','drive-creds::','only-upload','repair-csv','repair-csv-no-upload']);
+function isAbsolutePath(string $path): bool
+{
+    if ($path === '') return false;
+    return preg_match('/^([A-Za-z]:[\\\\\\/]|\\\\\\\\|\\/)/', $path) === 1;
+}
+
+function resolveCityCsvPath(?string $cliPath, string $projectRoot): string
+{
+    if ($cliPath === null || $cliPath === '') {
+        throw new \RuntimeException('--city-data-file is required when city_data_sheet=local');
+    }
+
+    $candidate = $cliPath;
+    if (!isAbsolutePath($candidate)) {
+        $candidate = rtrim($projectRoot, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . ltrim($candidate, DIRECTORY_SEPARATOR);
+    }
+
+    if (!is_file($candidate)) {
+        throw new \RuntimeException("City data CSV not found: {$candidate}");
+    }
+    if (!is_readable($candidate) || !is_writable($candidate)) {
+        throw new \RuntimeException("City data CSV must be readable and writable: {$candidate}");
+    }
+
+    $real = realpath($candidate);
+    return $real !== false ? $real : $candidate;
+}
+
+$opts = getopt('', ['config::','env::','daily-start','no_progress','upload-to-drive::','drive-token::','drive-creds::','city-data-file::','only-upload','repair-csv','repair-csv-no-upload']);
 
 function discoverCampaignIds(string $baseDir, array $config): array
 {
@@ -133,10 +163,18 @@ if (is_readable($configPath)) {
     exit(1);
 }
 
-$defaultBaseDir = realpath(__DIR__ . '/../basedir') ?: getcwd();
+$projectRoot = realpath(__DIR__ . '/..') ?: getcwd();
+$defaultBaseDir = is_dir(__DIR__ . '/../basedir') ? realpath(__DIR__ . '/../basedir') : $projectRoot;
 $baseDir = $config['base_dir'] ?? $defaultBaseDir;
 $onlyUpload = isset($opts['only-upload']);
 $uploadRequested = isset($opts['upload-to-drive']) || $onlyUpload;
+
+$cityDataMode = $config['city_data_sheet'] ?? null;
+$cityDataRange = $config['city_data_range'] ?? 'E2:F';
+$cityDataFileCli = $opts['city-data-file'] ?? null;
+$searchQuota = (int)($config['search_quota'] ?? 20);
+$cityBatchSize = max(1, $searchQuota > 0 ? $searchQuota : 20);
+
 
 if ($repairMode && ($onlyUpload || isset($opts['daily-start']))) {
     fwrite(STDERR, "--repair-csv cannot be combined with daily pipeline flag or --only-upload\n");
@@ -180,6 +218,19 @@ try {
     }
 
     if (isset($opts['daily-start'])) {
+        if (is_string($cityDataMode) && $cityDataMode !== '') {
+            if (strtolower($cityDataMode) === 'local') {
+                $cityCsvPath = resolveCityCsvPath($cityDataFileCli, $projectRoot);
+                $updatedRows = CitySchedule::rescheduleCsv($cityCsvPath, $cityBatchSize);
+                echo "City schedule refreshed (local CSV): {$updatedRows} rows\n";
+            } else {
+                $credsPath = $opts['drive-creds'] ?? __DIR__ . '/../client_secret.json';
+                $tokenPath = $opts['drive-token'] ?? __DIR__ . '/../token.json';
+                $citySheetManager = new CitySheetManager($credsPath, $tokenPath);
+                $updatedRows = $citySheetManager->rescheduleSheet($cityDataMode, $cityDataRange, $cityBatchSize);
+                echo "City schedule refreshed (Google Sheet): {$updatedRows} rows\n";
+            }
+        }
         $res = $pipeline->runDaily(isset($opts['no_progress']));
         $pipeline->saveConfig($configPath);
         echo "Daily run finished\n";
