@@ -15,14 +15,15 @@ Daily runs operate inside `base_dir` and can optionally mirror results to Google
 ### Daily run highlights
 
 1. **City schedule upkeep** — when `city_data_sheet` is configured, the worker fills in missing dates (local CSV or Google Sheet) so that each batch of `search_quota` rows shares the same date in `DD/MM/YYYY` format, advancing one day per batch while leaving existing dates untouched.
-2. **Campaign discovery & queue sync** — `campaign_keyword` identifies remote campaigns; IDs already exported are skipped, new IDs are pushed into `campaigns_queued`. Each queued campaign is probed via `GET /api/searches/{id}` and promoted to `campaigns_unexported` once it has at least `search_quota` (default 20) completed searches.
-3. **Locking** — `export.lock` inside `base_dir` prevents overlapping daily runs.
-4. **Exports** — for each campaign in `campaigns_unexported`:
+1. **Drive synchronisation** — before and after the daily run the worker compares `LeadSwift_*` directories with Google Drive, downloading missing remote files and uploading local ones so both sides stay aligned.
+1. **Campaign discovery & queue sync** — `campaign_keyword` identifies remote campaigns; IDs already exported are skipped, new IDs are pushed into `campaigns_queued`. Each queued campaign is probed via `GET /api/searches/{id}` and promoted to `campaigns_unexported` once it has at least `search_quota` (default 20) completed searches.
+1. **Locking** — `export.lock` inside `base_dir` prevents overlapping daily runs.
+1. **Exports** — for each campaign in `campaigns_unexported`:
    - Fetch all searches, start exports via `export_leads_begin`, and poll `export_leads_status` until a downloadable CSV is returned.
    - Downloaded CSVs for a campaign are stored in `LeadSwift_RAW/campaign_<id>/search_XX.csv`.
-5. **Merge** — all downloaded CSVs are merged into `LeadSwift_MERGED/campaign_<id>/merge_N.csv` while keeping a single header row.
-6. **Prepare** — contacts are normalised by company: the pipeline produces `LeadSwift_PREPARED/campaign_<id>/prepared_N.csv` with columns `Company`, `Contact Label`, `Email`, `Phone`.
-7. **Queue cleanup** — exported IDs are removed from `campaigns_unexported`/`campaigns_queued` and appended to `campaigns_exported_all`; `config.json` is saved back to disk.
+1. **Merge** — all downloaded CSVs are merged into `LeadSwift_MERGED/campaign_<id>/merge_N.csv` while keeping a single header row.
+1. **Prepare** — contacts are normalised by company: the pipeline produces `LeadSwift_PREPARED/campaign_<id>/prepared_N.csv` with columns `Company`, `Contact Label`, `Email`, `Phone`.
+1. **Queue cleanup** — exported IDs are removed from `campaigns_unexported`/`campaigns_queued` and appended to `campaigns_exported_all`; `config.json` is saved back to disk.
 
 ### Google Drive / Sheets uploads
 
@@ -51,6 +52,8 @@ composer dump-autoload
   "export_csv_params": "export_csv_params=%7B...%7D&one_contact_per_row=1",
   "base_dir": "/path/to/base_dir",
   "log_level": "INFO",
+  "log_retention_days": 3,
+  "lock_timeout_seconds": 21600,
   "campaign_keyword": "Restaurants Batch",
   "search_keyword": "restaurants",
   "search_quota": 20,
@@ -84,15 +87,15 @@ Upload existing artifacts without a new export:
 php bin/run.php --config=/path/config.json --only-upload --drive-creds=/path/client_secret.json --drive-token=/path/token.json
 ```
 
-When `city_data_sheet` holds a Google Sheet ID, the daily worker refreshes the sheet via the Google Sheets API using the same credential flags (`--drive-creds`, `--drive-token`).
+This command performs the same two-way sync step as the daily worker (downloads missing remote files and uploads locally missing ones). When `city_data_sheet` holds a Google Sheet ID, the daily worker refreshes the sheet via the Google Sheets API using the same credential flags (`--drive-creds`, `--drive-token`).
 
 ## Locking
 
-The pipeline uses `export.lock` in `base_dir` to prevent concurrent runs.
+The pipeline uses `export.lock` in `base_dir` to prevent concurrent runs. The lock self-heals if it becomes stale (configurable timeout via `lock_timeout_seconds`, default 6 hours).
 
 ## Logging
 
-Logs are written into `base_dir/logs/lead_swift_YYYY-MM-DD_HH-MM-SS.log` and also echoed to stdout. You can control `log_level` via `config.json` (DEBUG, INFO, WARN, ERROR).
+Logs are written into `base_dir/logs/lead_swift_YYYY-MM-DD_HH-MM-SS.log` and also echoed to stdout. You can control `log_level` via `config.json` (DEBUG, INFO, WARN, ERROR). Older log files are pruned automatically (default retention 3 days, configurable via `log_retention_days`).
 
 ## Notes
 

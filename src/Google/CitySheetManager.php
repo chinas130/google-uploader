@@ -68,48 +68,51 @@ class CitySheetManager
 
     private function expandRange(string $range, int $rowsCount): string
     {
-        if (preg_match('/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/i', $range, $m)) {
+        if ($rowsCount <= 0) return $range;
+
+        $sheetPrefix = '';
+        $rangePart = $range;
+        if (strpos($range, '!') !== false) {
+            [$sheet, $rangePart] = explode('!', $range, 2);
+            $sheetPrefix = trim($sheet) !== '' ? trim($sheet) . '!' : '';
+            $rangePart = ltrim($rangePart);
+        }
+
+        if (preg_match('/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/i', $rangePart, $m)) {
             $startCol = strtoupper($m[1]);
             $startRow = (int)$m[2];
             $endCol = strtoupper($m[3]);
             $endRow = $startRow + $rowsCount - 1;
-            return "{$startCol}{$startRow}:{$endCol}{$endRow}";
+            return $sheetPrefix . "{$startCol}{$startRow}:{$endCol}{$endRow}";
         }
 
-        if (preg_match('/^([A-Z]+)(\d+):([A-Z]+)$/i', $range, $m)) {
+        if (preg_match('/^([A-Z]+)(\d+):([A-Z]+)$/i', $rangePart, $m)) {
             $startCol = strtoupper($m[1]);
             $startRow = (int)$m[2];
             $endCol = strtoupper($m[3]);
             $endRow = $startRow + $rowsCount - 1;
-            return "{$startCol}{$startRow}:{$endCol}{$endRow}";
+            return $sheetPrefix . "{$startCol}{$startRow}:{$endCol}{$endRow}";
         }
 
-        if (preg_match('/^([A-Z]+)(\d+)$/i', $range, $m)) {
+        if (preg_match('/^([A-Z]+)(\d+)$/i', $rangePart, $m)) {
             $startCol = strtoupper($m[1]);
             $startRow = (int)$m[2];
             $endRow = $startRow + $rowsCount - 1;
-            return "{$startCol}{$startRow}:{$startCol}{$endRow}";
+            return $sheetPrefix . "{$startCol}{$startRow}:{$startCol}{$endRow}";
         }
 
-        // fallback for plain column specification like "E2:F"
-        if (preg_match('/^([A-Z]+)(\d+):([A-Z]+)$/i', $range, $m)) {
-            $startCol = strtoupper($m[1]);
-            $startRow = (int)$m[2];
-            $endCol = strtoupper($m[3]);
-            $endRow = $startRow + $rowsCount - 1;
-            return "{$startCol}{$startRow}:{$endCol}{$endRow}";
-        }
-
-        if (preg_match('/^([A-Z]+):([A-Z]+)$/i', $range, $m)) {
+        if (preg_match('/^([A-Z]+):([A-Z]+)$/i', $rangePart, $m)) {
             $startCol = strtoupper($m[1]);
             $endCol = strtoupper($m[2]);
             $startRow = 1;
             $endRow = $rowsCount;
-            return "{$startCol}{$startRow}:{$endCol}{$endRow}";
+            return $sheetPrefix . "{$startCol}{$startRow}:{$endCol}{$endRow}";
         }
 
         // default fallback
+        if ($sheetPrefix !== '') {
+            return $range;
+        }
         return "E2:F" . (1 + $rowsCount);
     }
 }
-

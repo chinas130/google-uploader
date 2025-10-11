@@ -98,6 +98,98 @@ function resolveCityCsvPath(?string $cliPath, string $projectRoot): string
     return $real !== false ? $real : $candidate;
 }
 
+$syncDirectories = ['LeadSwift_RAW', 'LeadSwift_MERGED', 'LeadSwift_PREPARED', 'LeadSwift_PREPARED_WEEK'];
+
+function getSyncDirectories(): array
+{
+    return ['LeadSwift_RAW', 'LeadSwift_MERGED', 'LeadSwift_PREPARED', 'LeadSwift_PREPARED_WEEK'];
+}
+
+function listLocalFiles(string $rootDir): array
+{
+    $result = [];
+    if (!is_dir($rootDir)) return $result;
+    $rootDir = rtrim($rootDir, DIRECTORY_SEPARATOR);
+
+    $iterator = new \RecursiveIteratorIterator(
+        new \RecursiveDirectoryIterator($rootDir, \FilesystemIterator::SKIP_DOTS)
+    );
+    foreach ($iterator as $fileInfo) {
+        if (!$fileInfo->isFile()) continue;
+        $absolute = $fileInfo->getPathname();
+        $relative = substr($absolute, strlen($rootDir) + 1);
+        $relative = str_replace(DIRECTORY_SEPARATOR, '/', $relative);
+        $result[$relative] = $absolute;
+    }
+    return $result;
+}
+
+function syncDriveWithLocal(DriveUploader $uploader, string $baseDir, array $directories): array
+{
+    $summary = ['uploaded' => 0, 'downloaded' => 0];
+    $baseDir = rtrim($baseDir, DIRECTORY_SEPARATOR);
+
+    foreach ($directories as $dirName) {
+        $localRoot = $baseDir . DIRECTORY_SEPARATOR . $dirName;
+        if (!is_dir($localRoot)) {
+            if (!mkdir($localRoot, 0777, true) && !is_dir($localRoot)) {
+                throw new \RuntimeException("Cannot create local directory: {$localRoot}");
+            }
+        }
+
+        $localFiles = listLocalFiles($localRoot);
+        $remoteFiles = $uploader->listRemoteFiles($dirName);
+
+        $remoteKeys = array_keys($remoteFiles);
+        $localKeys = array_keys($localFiles);
+
+        $toUpload = array_diff($localKeys, $remoteKeys);
+        foreach ($toUpload as $relative) {
+            $absolute = $localFiles[$relative];
+            $remotePath = $dirName . '/' . $relative;
+            try {
+                $uploader->uploadFileFromPath($absolute, $remotePath);
+                $summary['uploaded']++;
+            } catch (\Exception $e) {
+                fwrite(STDERR, "Upload sync failed for {$absolute}: " . $e->getMessage() . "\n");
+            }
+        }
+
+        $toDownload = array_diff($remoteKeys, $localKeys);
+        foreach ($toDownload as $relative) {
+            $meta = $remoteFiles[$relative];
+            $destPath = $localRoot . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relative);
+            $destDir = dirname($destPath);
+            if (!is_dir($destDir) && !mkdir($destDir, 0777, true) && !is_dir($destDir)) {
+                fwrite(STDERR, "Cannot create directory for download: {$destDir}\n");
+                continue;
+            }
+            try {
+                $uploader->downloadFileToPath($meta['id'], $destPath);
+                $summary['downloaded']++;
+            } catch (\Exception $e) {
+                fwrite(STDERR, "Download sync failed for {$relative}: " . $e->getMessage() . "\n");
+            }
+        }
+    }
+
+    return $summary;
+}
+
+function ensureDriveUploader(array $opts, ?DriveUploader &$cached, ?\Exception &$error = null): ?DriveUploader
+{
+    if ($cached !== null) return $cached;
+    if ($error !== null) return null;
+    try {
+        $cached = buildDriveUploader($opts);
+        return $cached;
+    } catch (\Exception $e) {
+        $error = $e;
+        fwrite(STDERR, "Drive client init failed: " . $e->getMessage() . "\n");
+        return null;
+    }
+}
+
 $opts = getopt('', ['config::','env::','daily-start','no_progress','upload-to-drive::','drive-token::','drive-creds::','city-data-file::','only-upload','repair-csv','repair-csv-no-upload']);
 
 function discoverCampaignIds(string $baseDir, array $config): array
@@ -167,13 +259,14 @@ $projectRoot = realpath(__DIR__ . '/..') ?: getcwd();
 $defaultBaseDir = is_dir(__DIR__ . '/../basedir') ? realpath(__DIR__ . '/../basedir') : $projectRoot;
 $baseDir = $config['base_dir'] ?? $defaultBaseDir;
 $onlyUpload = isset($opts['only-upload']);
-$uploadRequested = isset($opts['upload-to-drive']) || $onlyUpload;
-
 $cityDataMode = $config['city_data_sheet'] ?? null;
 $cityDataRange = $config['city_data_range'] ?? 'E2:F';
 $cityDataFileCli = $opts['city-data-file'] ?? null;
 $searchQuota = (int)($config['search_quota'] ?? 20);
 $cityBatchSize = max(1, $searchQuota > 0 ? $searchQuota : 20);
+
+$driveUploaderInstance = null;
+$driveInitError = null;
 
 
 if ($repairMode && ($onlyUpload || isset($opts['daily-start']))) {
@@ -211,9 +304,13 @@ try {
     }
 
     if ($onlyUpload) {
-        $uploader = buildDriveUploader($opts);
-        $campaignsForUpload = discoverCampaignIds($baseDir, $config);
-        uploadCampaignArtifacts($uploader, $baseDir, $campaignsForUpload);
+        $uploader = ensureDriveUploader($opts, $driveUploaderInstance, $driveInitError);
+        if ($uploader === null) {
+            fwrite(STDERR, "Drive sync unavailable — cannot connect to Google Drive\n");
+            exit(1);
+        }
+        $summary = syncDriveWithLocal($uploader, $baseDir, getSyncDirectories());
+        echo "Drive sync (manual) uploaded={$summary['uploaded']} downloaded={$summary['downloaded']}\n";
         exit(0);
     }
 
@@ -226,20 +323,29 @@ try {
             } else {
                 $credsPath = $opts['drive-creds'] ?? __DIR__ . '/../client_secret.json';
                 $tokenPath = $opts['drive-token'] ?? __DIR__ . '/../token.json';
-                $citySheetManager = new CitySheetManager($credsPath, $tokenPath);
-                $updatedRows = $citySheetManager->rescheduleSheet($cityDataMode, $cityDataRange, $cityBatchSize);
-                echo "City schedule refreshed (Google Sheet): {$updatedRows} rows\n";
+                try {
+                    $citySheetManager = new CitySheetManager($credsPath, $tokenPath);
+                    $updatedRows = $citySheetManager->rescheduleSheet($cityDataMode, $cityDataRange, $cityBatchSize);
+                    echo "City schedule refreshed (Google Sheet): {$updatedRows} rows\n";
+                } catch (\Exception $e) {
+                    fwrite(STDERR, "City schedule refresh failed: " . $e->getMessage() . "\n");
+                }
             }
         }
+
+        $driveForSync = ensureDriveUploader($opts, $driveUploaderInstance, $driveInitError);
+        if ($driveForSync !== null) {
+            $beforeSummary = syncDriveWithLocal($driveForSync, $baseDir, getSyncDirectories());
+            echo "Drive sync (before daily run) uploaded={$beforeSummary['uploaded']} downloaded={$beforeSummary['downloaded']}\n";
+        }
+
         $res = $pipeline->runDaily(isset($opts['no_progress']));
         $pipeline->saveConfig($configPath);
         echo "Daily run finished\n";
 
-        // If upload-to-drive flag provided, upload RAW, MERGED and PREPARED for exported campaigns
-        if ($uploadRequested) {
-            $uploader = buildDriveUploader($opts);
-            $exported = $res['exported_ids'] ?? [];
-            uploadCampaignArtifacts($uploader, $baseDir, $exported);
+        if ($driveUploaderInstance !== null) {
+            $afterSummary = syncDriveWithLocal($driveUploaderInstance, $baseDir, getSyncDirectories());
+            echo "Drive sync (after daily run) uploaded={$afterSummary['uploaded']} downloaded={$afterSummary['downloaded']}\n";
         }
     }
 } catch (Exception $e) {

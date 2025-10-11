@@ -2,6 +2,18 @@
 namespace App\LeadSwift;
 
 class Utils {
+    private const HTTP_TIMEOUT = 60; // seconds
+    private const HTTP_CONNECT_TIMEOUT = 15; // seconds
+    private const HTTP_RETRY_ATTEMPTS = 3;
+    private const HTTP_RETRY_STATUS = [500, 502, 503, 504, 429];
+    private const CURL_RETRY_ERRORS = [
+        CURLE_OPERATION_TIMEOUTED,
+        CURLE_COULDNT_RESOLVE_HOST,
+        CURLE_COULDNT_CONNECT,
+        CURLE_RECV_ERROR,
+        CURLE_SEND_ERROR,
+    ];
+
     public static function loadEnvFile(?string $path): array {
         $vars = [];
         if ($path && is_readable($path)) {
@@ -27,35 +39,24 @@ class Utils {
     }
 
     public static function httpGet(string $url): string {
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HTTPGET, true);
-        $resp = curl_exec($ch);
-        if ($resp === false) { $e = curl_error($ch); curl_close($ch); throw new \Exception('GET error: '.$e); }
-        curl_close($ch);
-        return $resp;
+        return self::performRequest($url, function($ch) {
+            curl_setopt($ch, CURLOPT_HTTPGET, true);
+        }, 'GET');
     }
 
     public static function httpPostRaw(string $url, string $body): string {
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
-        $resp = curl_exec($ch);
-        if ($resp === false) { $e = curl_error($ch); curl_close($ch); throw new \Exception('POST error: '.$e); }
-        curl_close($ch);
-        return $resp;
+        return self::performRequest($url, function($ch) use ($body) {
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+        }, 'POST');
     }
 
     public static function httpPostForm(string $url, array $arr): string {
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($arr));
-        $resp = curl_exec($ch);
-        if ($resp === false) { $e = curl_error($ch); curl_close($ch); throw new \Exception('POST error: '.$e); }
-        curl_close($ch);
-        return $resp;
+        return self::performRequest($url, function($ch) use ($arr) {
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($arr));
+            curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/x-www-form-urlencoded']);
+        }, 'POST');
     }
 
     public static function detectProgress($data, array &$extra): array {
@@ -121,6 +122,91 @@ class Utils {
         file_put_contents($tmp, $contents);
         rename($tmp, $path);
     }
+
+    private static function performRequest(string $url, callable $configure, string $method): string
+    {
+        $attempts = max(1, self::HTTP_RETRY_ATTEMPTS);
+        $backoffBase = 2.0;
+        $lastError = 'unknown error';
+
+        for ($attempt = 0; $attempt < $attempts; $attempt++) {
+            $ch = curl_init($url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_HEADER, false);
+            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, self::HTTP_CONNECT_TIMEOUT);
+            curl_setopt($ch, CURLOPT_TIMEOUT, self::HTTP_TIMEOUT);
+            curl_setopt($ch, CURLOPT_FAILONERROR, false);
+
+            $configure($ch);
+
+            $resp = curl_exec($ch);
+            $errno = curl_errno($ch);
+            $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $curlError = curl_error($ch);
+            curl_close($ch);
+
+            if ($resp === false) {
+                $lastError = $curlError ?: 'cURL error '.$errno;
+                if ($attempt < $attempts - 1 && in_array($errno, self::CURL_RETRY_ERRORS, true)) {
+                    usleep((int)(($backoffBase ** $attempt) * 250000));
+                    continue;
+                }
+                throw new \Exception(sprintf('%s %s failed: %s', $method, $url, $lastError));
+            }
+
+            if ($httpCode >= 200 && $httpCode < 300) {
+                return $resp;
+            }
+
+            $message = self::extractHttpErrorMessage($resp, $httpCode);
+            $lastError = "HTTP {$httpCode}: {$message}";
+
+            if ($attempt < $attempts - 1 && in_array($httpCode, self::HTTP_RETRY_STATUS, true)) {
+                usleep((int)(($backoffBase ** $attempt) * 250000));
+                continue;
+            }
+
+            throw new \Exception(sprintf('%s %s failed with status %d: %s', $method, $url, $httpCode, $message));
+        }
+
+        throw new \Exception(sprintf('%s %s failed: %s', $method, $url, $lastError));
+    }
+
+    private static function extractHttpErrorMessage(string $body, int $code): string
+    {
+        $trimmed = trim($body);
+        if ($trimmed === '') {
+            return self::defaultHttpMessage($code);
+        }
+
+        $json = json_decode($trimmed, true);
+        if (is_array($json)) {
+            foreach (['message', 'error', 'detail'] as $key) {
+                if (!empty($json[$key]) && is_string($json[$key])) {
+                    return $json[$key];
+                }
+            }
+        }
+
+        $snippet = substr($trimmed, 0, 200);
+        $snippet = preg_replace('/\\s+/', ' ', $snippet ?? '');
+        return $snippet !== '' ? $snippet : self::defaultHttpMessage($code);
+    }
+
+    private static function defaultHttpMessage(int $code): string
+    {
+        return match ($code) {
+            400 => 'Bad Request',
+            401 => 'Unauthorized',
+            403 => 'Forbidden',
+            404 => 'Not Found',
+            408 => 'Request Timeout',
+            429 => 'Too Many Requests',
+            500 => 'Internal Server Error',
+            502 => 'Bad Gateway',
+            503 => 'Service Unavailable',
+            504 => 'Gateway Timeout',
+            default => 'HTTP error',
+        };
+    }
 }
-
-

@@ -8,6 +8,8 @@ class Pipeline {
     private array $config;
     private string $baseDir;
     private string $logFile;
+    private string $lockFile;
+    private bool $lockHeld = false;
     private Logger $logger;
 
     public function __construct(array $config, string $baseDir)
@@ -15,9 +17,102 @@ class Pipeline {
         $this->config = $config;
         $this->baseDir = rtrim($baseDir, DIRECTORY_SEPARATOR);
         $logDir = $this->baseDir . '/logs';
+        $this->lockFile = $this->baseDir . '/export.lock';
         if (!is_dir($logDir)) mkdir($logDir, 0777, true);
+        $this->pruneOldLogs($logDir, (int)($this->config['log_retention_days'] ?? 3));
         $this->logFile = $logDir . '/lead_swift_' . date('Y-m-d_H-i-s') . '.log';
         $this->logger = new Logger($this->logFile, $this->config['log_level'] ?? 'INFO');
+        register_shutdown_function(function () {
+            $this->releaseLock();
+        });
+    }
+    private function pruneOldLogs(string $logDir, int $days): void
+    {
+        $days = max(1, $days);
+        $threshold = time() - ($days * 86400);
+        foreach (glob($logDir . '/lead_swift_*.log') ?: [] as $file) {
+            if (!is_file($file)) continue;
+            $mtime = @filemtime($file);
+            if ($mtime === false) continue;
+            if ($mtime < $threshold) {
+                @unlink($file);
+            }
+        }
+    }
+
+    private function acquireLock(): void
+    {
+        $ttl = max(60, (int)($this->config['lock_timeout_seconds'] ?? 21600));
+        $lockPath = $this->lockFile;
+
+        if (file_exists($lockPath)) {
+            $info = $this->readLockInfo($lockPath);
+            $created = (int)($info['created_at'] ?? @filemtime($lockPath) ?: 0);
+            $pid = isset($info['pid']) ? (int)$info['pid'] : null;
+            $age = time() - $created;
+            $stale = $age > $ttl;
+
+            if (!$stale && $pid !== null && function_exists('posix_kill')) {
+                if ($pid !== getmypid() && !@posix_kill($pid, 0)) {
+                    $stale = true;
+                }
+            }
+
+            if ($stale) {
+                if (isset($this->logger)) {
+                    $this->logger->warn("Removing stale export lock (age={$age}s pid=" . ($pid ?? 'unknown') . ")");
+                }
+                @unlink($lockPath);
+            } else {
+                throw new \Exception('Another export is running (lock active)');
+            }
+        }
+
+        $handle = @fopen($lockPath, 'x');
+        if ($handle === false) {
+            if (file_exists($lockPath)) {
+                throw new \Exception('Another export is running (lock active)');
+            }
+            throw new \Exception('Unable to create export lock file');
+        }
+
+        $payload = json_encode([
+            'pid' => getmypid(),
+            'created_at' => time(),
+            'hostname' => php_uname('n'),
+        ], JSON_UNESCAPED_SLASHES);
+        if ($payload === false) {
+            $payload = (string)time();
+        }
+        fwrite($handle, $payload);
+        fclose($handle);
+        $this->lockHeld = true;
+    }
+
+    private function releaseLock(): void
+    {
+        if (!$this->lockHeld) return;
+        if (is_file($this->lockFile)) {
+            $info = $this->readLockInfo($this->lockFile);
+            $pid = isset($info['pid']) ? (int)$info['pid'] : null;
+            if ($pid === null || $pid === getmypid()) {
+                @unlink($this->lockFile);
+            }
+        }
+        $this->lockHeld = false;
+    }
+
+    private function readLockInfo(string $path): array
+    {
+        $contents = @file_get_contents($path);
+        if ($contents === false) return [];
+        $data = json_decode($contents, true);
+        return is_array($data) ? $data : [];
+    }
+
+    public function __destruct()
+    {
+        $this->releaseLock();
     }
 
     private function syncCampaignQueues(): void {
@@ -105,12 +200,8 @@ class Pipeline {
         $this->logger->info("Starting daily run");
         // Discover campaigns by keyword and update queues
         $this->syncCampaignQueues();
-        // create lock
-        $lock = $this->baseDir . '/export.lock';
-        if (file_exists($lock)) {
-            throw new \Exception('Another export is running');
-        }
-        file_put_contents($lock, (string)time());
+
+        $this->acquireLock();
 
         try {
             // pick batch-size from config
@@ -133,7 +224,7 @@ class Pipeline {
             $this->logger->info("Daily run finished: RAW=" . count($downloaded['downloaded']) . "; EXPORTED_IDS=" . json_encode($downloaded['exported_ids']));
             return $downloaded;
         } finally {
-            if (file_exists($lock)) unlink($lock);
+            $this->releaseLock();
         }
     }
 

@@ -4,6 +4,9 @@ namespace App\Google;
 use Google\Client;
 use Google\Service\Drive;
 use Google\Service\Sheets;
+use Google\Service\Exception as GoogleServiceException;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\StreamInterface;
 
 class DriveUploader {
     private Client $client;
@@ -104,6 +107,76 @@ class DriveUploader {
         $body = new \Google\Service\Sheets\ValueRange(['values' => $values]);
         $params = ['valueInputOption' => 'RAW'];
         $this->sheets->spreadsheets_values->update($spreadsheetId, $range, $body, $params);
+    }
+
+    public function listRemoteFiles(string $remotePrefix): array
+    {
+        [$normalized, $segments] = $this->normalizeRemotePath($remotePrefix);
+        if ($normalized === '') return [];
+
+        $folderId = $this->locateFolderChain($segments, null);
+        if ($folderId === null) return [];
+
+        $result = [];
+        $this->collectRemoteFiles($folderId, '', $result);
+        return $result;
+    }
+
+    public function downloadFileToPath(string $fileId, string $destPath): void
+    {
+        try {
+            $data = $this->downloadFileContents($fileId, false);
+        } catch (GoogleServiceException $e) {
+            if ($this->shouldRetryAsAbusive($e)) {
+                $data = $this->downloadFileContents($fileId, true);
+            } else {
+                throw $e;
+            }
+        }
+        file_put_contents($destPath, $data);
+    }
+
+    private function normalizeRemotePath(string $remotePath): array
+    {
+        $normalized = trim(str_replace('\\', '/', $remotePath), '/');
+        $segments = array_values(array_filter(
+            explode('/', $normalized),
+            fn($seg) => $seg !== '' && $seg !== '.' && $seg !== '..'
+        ));
+        return [$normalized, $segments];
+    }
+
+    private function collectRemoteFiles(string $folderId, string $relativePath, array &$result): void
+    {
+        $pageToken = null;
+        do {
+            $params = [
+                'q' => sprintf("'%s' in parents and trashed = false", $folderId),
+                'spaces' => 'drive',
+                'fields' => 'nextPageToken, files(id,name,mimeType)',
+                'pageSize' => 1000,
+            ];
+            if ($pageToken !== null) {
+                $params['pageToken'] = $pageToken;
+            }
+            $response = $this->drive->files->listFiles($params);
+            $files = $response->getFiles();
+            if ($files) {
+                foreach ($files as $file) {
+                    $name = $file->getName();
+                    $mime = $file->getMimeType();
+                    if ($mime === 'application/vnd.google-apps.folder') {
+                        $this->collectRemoteFiles($file->getId(), $relativePath . $name . '/', $result);
+                        continue;
+                    }
+                    $result[$relativePath . $name] = [
+                        'id' => $file->getId(),
+                        'mimeType' => $mime,
+                    ];
+                }
+            }
+            $pageToken = $response->getNextPageToken();
+        } while ($pageToken);
     }
 
     private function ensureFolderChain(array $segments, ?string $parentId = null): ?string
@@ -225,5 +298,39 @@ class DriveUploader {
                 fwrite(STDERR, "Failed to delete remote folder {$folderId}: " . $e->getMessage() . "\n");
             }
         }
+    }
+
+    private function downloadFileContents(string $fileId, bool $acknowledgeAbuse): string
+    {
+        $params = ['alt' => 'media'];
+        if ($acknowledgeAbuse) {
+            $params['acknowledgeAbuse'] = true;
+        }
+        $response = $this->drive->files->get($fileId, $params);
+
+        if ($response instanceof ResponseInterface) {
+            return $response->getBody()->getContents();
+        }
+        if ($response instanceof StreamInterface) {
+            return $response->getContents();
+        }
+        if (is_object($response) && method_exists($response, 'getBody')) {
+            return $response->getBody()->getContents();
+        }
+        return (string)$response;
+    }
+
+    private function shouldRetryAsAbusive(GoogleServiceException $e): bool
+    {
+        if ($e->getCode() !== 403) return false;
+        $errors = $e->getErrors();
+        if (!is_array($errors)) return false;
+        foreach ($errors as $err) {
+            if (!isset($err['reason'])) continue;
+            if ($err['reason'] === 'cannotDownloadAbusiveFile') {
+                return true;
+            }
+        }
+        return false;
     }
 }
