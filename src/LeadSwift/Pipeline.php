@@ -120,23 +120,10 @@ class Pipeline {
         $apiKey = $this->config['api_key'] ?? null;
         if (!$kw || !$apiKey) return;
 
-        $url = "https://leadswift.com/api/campaigns?api_key=" . urlencode($apiKey);
         try {
-            $resp = Utils::httpGet($url);
+            $all = $this->fetchCampaignsList($apiKey);
         } catch (\Exception $e) {
             $this->logger->warn('Campaign discovery failed: ' . $e->getMessage());
-            return;
-        }
-
-        $json = json_decode($resp, true);
-        if ($json === null && json_last_error() !== JSON_ERROR_NONE) {
-            $this->logger->warn('Campaign discovery returned invalid JSON');
-            return;
-        }
-
-        $all = $json['data'] ?? $json;
-        if (!is_array($all)) {
-            $this->logger->warn('Campaign discovery response missing data array');
             return;
         }
 
@@ -171,14 +158,22 @@ class Pipeline {
         $stillQueued = [];
         foreach ($queued as $campId) {
             try {
-                $count = $this->fetchCampaignSearchCount($campId);
+                [$readyCount, $totalCount] = $this->fetchCampaignSearchStats($campId);
             } catch (\Exception $e) {
                 $this->logger->warn("Failed to inspect campaign {$campId}: " . $e->getMessage());
                 $stillQueued[] = $campId;
                 continue;
             }
 
-            if ($count >= $quota) {
+            $this->logger->debug(sprintf(
+                'Campaign %s readiness: ready=%d total=%d quota=%d',
+                $campId,
+                $readyCount,
+                $totalCount,
+                $quota
+            ));
+
+            if ($totalCount >= $quota) {
                 $ready[] = $campId;
             } else {
                 $stillQueued[] = $campId;
@@ -194,6 +189,275 @@ class Pipeline {
             count($ready),
             count($stillQueued)
         ));
+    }
+
+    private function fetchCampaignsList(string $apiKey): array
+    {
+        $url = "https://leadswift.com/api/campaigns?api_key=" . urlencode($apiKey);
+        $resp = Utils::httpGet($url);
+        $json = json_decode($resp, true);
+        if ($json === null && json_last_error() !== JSON_ERROR_NONE) {
+            throw new \Exception('Campaign discovery returned invalid JSON');
+        }
+        $all = $json['data'] ?? $json;
+        if (!is_array($all)) {
+            throw new \Exception('Campaign discovery response missing data array');
+        }
+        return $all;
+    }
+
+    public function createCampaignAndSeedSearches(array $cityRows): ?string
+    {
+        $apiKey = trim((string)($this->config['api_key'] ?? ''));
+        $campaignKeyword = trim((string)($this->config['campaign_keyword'] ?? ''));
+        $searchKeyword = trim((string)($this->config['search_keyword'] ?? ''));
+        $quota = (int)($this->config['search_quota'] ?? 0);
+
+        if ($apiKey === '' || $campaignKeyword === '' || $searchKeyword === '' || $quota <= 0) {
+            return null;
+        }
+
+        $today = (new \DateTimeImmutable('today'))->format('d/m/Y');
+        $locations = [];
+        foreach ($cityRows as $row) {
+            if (!is_array($row)) continue;
+            $location = isset($row[0]) ? trim((string)$row[0]) : '';
+            $dateValue = isset($row[1]) ? trim((string)$row[1]) : '';
+            if ($location === '' || $dateValue === '') continue;
+            $parsed = CitySchedule::parseDateString($dateValue);
+            if ($parsed === null) continue;
+            if ($parsed->format('d/m/Y') !== $today) continue;
+            $locations[] = $location;
+            if (count($locations) >= $quota) break;
+        }
+
+        if (!count($locations)) {
+            $this->logger->info('No city rows available for today — campaign creation skipped');
+            return null;
+        }
+
+        if (count($locations) < $quota) {
+            $this->logger->warn(sprintf(
+                'Only %d city rows available for today (quota=%d) — submitting fewer searches',
+                count($locations),
+                $quota
+            ));
+        }
+
+        try {
+            $campaigns = $this->fetchCampaignsList($apiKey);
+        } catch (\Exception $e) {
+            $this->logger->warn('Unable to fetch campaigns for creation: ' . $e->getMessage());
+            return null;
+        }
+
+        $nextNumber = $this->determineNextCampaignNumber($campaigns, $campaignKeyword);
+        $existingTitles = [];
+        foreach ($campaigns as $campaign) {
+            $name = trim((string)($campaign['name'] ?? $campaign['title'] ?? ''));
+            if ($name !== '') {
+                $existingTitles[strtolower($name)] = true;
+            }
+        }
+
+        $campaignTitle = trim($campaignKeyword . ' ' . $nextNumber);
+        while (isset($existingTitles[strtolower($campaignTitle)])) {
+            $nextNumber++;
+            $campaignTitle = trim($campaignKeyword . ' ' . $nextNumber);
+        }
+
+        try {
+            $campaignId = $this->createCampaign($apiKey, $campaignTitle);
+        } catch (\Exception $e) {
+            $this->logger->error('Campaign creation failed: ' . $e->getMessage());
+            return null;
+        }
+
+        $success = 0;
+        foreach ($locations as $location) {
+            try {
+                $this->submitSearch($apiKey, $campaignId, $searchKeyword, $location);
+                $success++;
+            } catch (\Exception $e) {
+                $this->logger->warn(sprintf(
+                    'Search submission failed (campaign=%s location=%s): %s',
+                    $campaignId,
+                    $location,
+                    $e->getMessage()
+                ));
+            }
+        }
+
+        if ($success === 0) {
+            $this->logger->warn(sprintf(
+                'No searches submitted successfully for campaign %s — leaving queue unchanged',
+                $campaignId
+            ));
+        }
+
+        $this->ensureCampaignTracked($campaignId);
+
+        $this->logger->info(sprintf(
+            'Created campaign "%s" (id=%s); submitted %d/%d searches',
+            $campaignTitle,
+            $campaignId,
+            $success,
+            count($locations)
+        ));
+
+        return $campaignId;
+    }
+
+    public function maybeCreateCampaignForToday(array $cityRows): ?string
+    {
+        $today = (new \DateTimeImmutable('today'))->format('d-m-Y');
+        $created = $this->getCampaignCreationMap();
+        $existingId = isset($created[$today]) ? trim((string)$created[$today]) : '';
+        if ($existingId !== '') {
+            $this->logger->info(sprintf(
+                'Campaign for today (%s) already exists: %s',
+                $today,
+                $existingId
+            ));
+            $this->ensureCampaignTracked($existingId);
+            return null;
+        }
+
+        $pendingQueue = array_map('strval', $this->config['campaigns_queued'] ?? []);
+        $pendingUnexported = array_map('strval', $this->config['campaigns_unexported'] ?? []);
+        $pending = array_values(array_filter(array_unique(array_merge($pendingQueue, $pendingUnexported)), fn($id) => trim((string)$id) !== ''));
+        if (count($pending)) {
+            $this->logger->info(sprintf(
+                'Pending campaigns detected (queued/unexported=%s) — skipping new campaign creation this run',
+                json_encode($pending)
+            ));
+            return null;
+        }
+
+        $campaignId = $this->createCampaignAndSeedSearches($cityRows);
+        if ($campaignId !== null) {
+            $created[$today] = $campaignId;
+            $this->setCampaignCreationMap($created);
+        }
+        return $campaignId;
+    }
+
+    private function determineNextCampaignNumber(array $campaigns, string $keyword): int
+    {
+        $pattern = '/^' . preg_quote($keyword, '/') . '\s*(\d+)$/i';
+        $max = 0;
+        foreach ($campaigns as $campaign) {
+            $name = trim((string)($campaign['name'] ?? $campaign['title'] ?? ''));
+            if ($name === '') continue;
+            if (preg_match($pattern, $name, $m)) {
+                $num = (int)$m[1];
+                if ($num > $max) {
+                    $max = $num;
+                }
+            }
+        }
+        return $max + 1;
+    }
+
+    private function createCampaign(string $apiKey, string $title): string
+    {
+        $url = "https://leadswift.com/api/campaigns?api_key=" . urlencode($apiKey);
+        $resp = Utils::httpPostForm($url, ['title' => $title]);
+        $json = json_decode($resp, true);
+        if ($json === null && json_last_error() !== JSON_ERROR_NONE) {
+            throw new \Exception('Create campaign returned invalid JSON');
+        }
+
+        $data = $json['data'] ?? $json;
+        if (is_array($data)) {
+            $id = $data['id'] ?? $data['campaign_id'] ?? $data['data'] ?? null;
+            if ($id === null && isset($data['value'])) {
+                $id = $data['value'];
+            }
+            if ($id !== null && $id !== '') {
+                return (string)$id;
+            }
+        } elseif (is_string($data) && $data !== '') {
+            return $data;
+        }
+
+        throw new \Exception('Create campaign response missing ID');
+    }
+
+    private function submitSearch(string $apiKey, string $campaignId, string $keyword, string $location): void
+    {
+        $url = "https://leadswift.com/api/searches?api_key=" . urlencode($apiKey);
+        $resp = Utils::httpPostForm($url, [
+            'campaign_id' => $campaignId,
+            'keyword' => $keyword,
+            'location' => $location,
+        ]);
+
+        $json = json_decode($resp, true);
+        if ($json === null && json_last_error() !== JSON_ERROR_NONE) {
+            throw new \Exception('Search submission returned invalid JSON');
+        }
+
+        if (isset($json['success']) && $json['success'] === false) {
+            $msg = $json['message'] ?? $json['error'] ?? $json['data'] ?? 'unknown error';
+            if (is_array($msg)) $msg = json_encode($msg);
+            throw new \Exception((string)$msg);
+        }
+    }
+
+    private function ensureCampaignTracked(string $campaignId): void
+    {
+        $campaignId = trim((string)$campaignId);
+        if ($campaignId === '') return;
+        $unexported = array_map('strval', $this->config['campaigns_unexported'] ?? []);
+        if (in_array($campaignId, $unexported, true)) {
+            return;
+        }
+        $queued = array_map('strval', $this->config['campaigns_queued'] ?? []);
+        if (!in_array($campaignId, $queued, true)) {
+            $queued[] = $campaignId;
+            $this->config['campaigns_queued'] = $queued;
+        }
+    }
+
+    private function getCampaignCreationMap(): array
+    {
+        $map = $this->config['campaigns_created_on'] ?? [];
+        if (!is_array($map)) {
+            $map = [];
+        }
+        return $map;
+    }
+
+    private function setCampaignCreationMap(array $map): void
+    {
+        $this->config['campaigns_created_on'] = $map;
+    }
+
+    private function removeExportedCampaignsFromCreationMap(array $exportedIds): void
+    {
+        if (!count($exportedIds)) return;
+        $map = $this->getCampaignCreationMap();
+        if (!count($map)) return;
+
+        $exportedIds = array_map('strval', $exportedIds);
+        $changed = false;
+        foreach ($map as $date => $campId) {
+            $campIdStr = trim((string)$campId);
+            if ($campIdStr === '') continue;
+            if (in_array($campIdStr, $exportedIds, true)) {
+                unset($map[$date]);
+                $this->logger->info(sprintf(
+                    'Cleared daily campaign marker %s for campaign %s',
+                    $date,
+                    $campIdStr
+                ));
+                $changed = true;
+            }
+        }
+        if ($changed) {
+            $this->setCampaignCreationMap($map);
+        }
     }
 
     public function runDaily(bool $noProgress = false): array {
@@ -220,6 +484,7 @@ class Pipeline {
                 if (!in_array($id, $exported, true)) $exported[] = $id;
             }
             $this->config['campaigns_exported_all'] = array_values($exported);
+            $this->removeExportedCampaignsFromCreationMap($processed);
 
             $this->logger->info("Daily run finished: RAW=" . count($downloaded['downloaded']) . "; EXPORTED_IDS=" . json_encode($downloaded['exported_ids']));
             return $downloaded;
@@ -356,7 +621,7 @@ class Pipeline {
         return ['downloaded' => $downloaded, 'exported_ids' => $exportedIds];
     }
 
-    private function fetchCampaignSearchCount(string $campaignId): int {
+    private function fetchCampaignSearchStats(string $campaignId): array {
         $url = "https://leadswift.com/api/searches/{$campaignId}?api_key=" . urlencode($this->config['api_key'] ?? '');
         $resp = Utils::httpGet($url);
         $json = json_decode($resp, true);
@@ -369,8 +634,67 @@ class Pipeline {
             throw new \Exception((string)$msg);
         }
         $data = $json['data'] ?? $json;
-        if (!is_array($data)) return 0;
-        return count($data);
+        if (!is_array($data)) return [0, 0];
+
+        $ready = 0;
+        $total = 0;
+        foreach ($data as $search) {
+            if (!is_array($search)) continue;
+            $total++;
+            if ($this->isSearchReady($search)) {
+                $ready++;
+            }
+        }
+        return [$ready, $total];
+    }
+
+    private function isSearchReady(array $search): bool
+    {
+        $statusFields = ['status', 'state', 'progress_status', 'export_status'];
+        foreach ($statusFields as $field) {
+            if (!empty($search[$field]) && is_string($search[$field])) {
+                $status = strtolower(trim($search[$field]));
+                if (in_array($status, ['completed', 'complete', 'finished', 'done', 'exported', 'ready'], true)) {
+                    return true;
+                }
+                if (in_array($status, ['pending', 'queued', 'processing', 'running', 'in_progress'], true)) {
+                    return false;
+                }
+            }
+        }
+
+        $boolFields = ['completed', 'is_completed', 'finished', 'is_finished', 'done'];
+        foreach ($boolFields as $field) {
+            if (isset($search[$field]) && $search[$field]) {
+                return true;
+            }
+        }
+
+        $dateFields = ['completed_at', 'finished_at', 'exported_at'];
+        foreach ($dateFields as $field) {
+            if (!empty($search[$field])) {
+                return true;
+            }
+        }
+
+        $progressFields = ['completed_percent', 'progress', 'percent', 'percentage', 'progress_percent'];
+        foreach ($progressFields as $field) {
+            if (isset($search[$field]) && is_numeric($search[$field]) && (float)$search[$field] >= 100) {
+                return true;
+            }
+        }
+
+        if (isset($search['download_url']) && is_string($search['download_url']) && $search['download_url'] !== '') {
+            return true;
+        }
+        if (isset($search['file_url']) && is_string($search['file_url']) && $search['file_url'] !== '') {
+            return true;
+        }
+        if (isset($search['file_download']) && is_string($search['file_download']) && $search['file_download'] !== '') {
+            return true;
+        }
+
+        return false;
     }
 
     private function mergeSourceFiles(array $sourceFiles, string $targetDir, string $prefix): ?string {

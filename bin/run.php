@@ -229,6 +229,33 @@ function discoverCampaignIds(string $baseDir, array $config): array
     return $candidates;
 }
 
+function loadCityScheduleFromCsv(string $path): array
+{
+    $rows = [];
+    if (!is_readable($path)) {
+        return $rows;
+    }
+    $handle = fopen($path, 'r');
+    if ($handle === false) {
+        return $rows;
+    }
+    $isHeader = true;
+    while (($row = fgetcsv($handle)) !== false) {
+        if ($isHeader) {
+            $isHeader = false;
+            continue;
+        }
+        $location = trim((string)($row[4] ?? ''));
+        $date = trim((string)($row[5] ?? ''));
+        if ($location === '' && $date === '') {
+            continue;
+        }
+        $rows[] = [$location, $date];
+    }
+    fclose($handle);
+    return $rows;
+}
+
 $repairMode = isset($opts['repair-csv']);
 $repairNoUpload = isset($opts['repair-csv-no-upload']);
 if ($repairNoUpload && !$repairMode) {
@@ -320,17 +347,32 @@ try {
                 $cityCsvPath = resolveCityCsvPath($cityDataFileCli, $projectRoot);
                 $updatedRows = CitySchedule::rescheduleCsv($cityCsvPath, $cityBatchSize);
                 echo "City schedule refreshed (local CSV): {$updatedRows} rows\n";
+                $cityRowsForAutomation = loadCityScheduleFromCsv($cityCsvPath);
             } else {
                 $credsPath = $opts['drive-creds'] ?? __DIR__ . '/../client_secret.json';
                 $tokenPath = $opts['drive-token'] ?? __DIR__ . '/../token.json';
+                $cityRowsForAutomation = [];
+                $citySheetManager = null;
                 try {
                     $citySheetManager = new CitySheetManager($credsPath, $tokenPath);
                     $updatedRows = $citySheetManager->rescheduleSheet($cityDataMode, $cityDataRange, $cityBatchSize);
                     echo "City schedule refreshed (Google Sheet): {$updatedRows} rows\n";
                 } catch (\Exception $e) {
                     fwrite(STDERR, "City schedule refresh failed: " . $e->getMessage() . "\n");
+                    $citySheetManager = null;
+                }
+                if ($citySheetManager !== null) {
+                    $cityRowsForAutomation = $citySheetManager->getScheduleRows($cityDataMode, $cityDataRange);
                 }
             }
+        }
+
+        if (!isset($cityRowsForAutomation)) {
+            $cityRowsForAutomation = [];
+        }
+        $createdCampaignId = $pipeline->maybeCreateCampaignForToday($cityRowsForAutomation);
+        if ($createdCampaignId !== null) {
+            echo "Campaign auto-created: {$createdCampaignId}\n";
         }
 
         $driveForSync = ensureDriveUploader($opts, $driveUploaderInstance, $driveInitError);

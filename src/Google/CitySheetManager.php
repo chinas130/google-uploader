@@ -52,6 +52,18 @@ class CitySheetManager
     }
 
     /**
+     * @return array<int, array<int, string>>
+     */
+    public function getScheduleRows(string $spreadsheetId, string $range = 'E2:F'): array
+    {
+        $rows = $this->sheets->getValues($spreadsheetId, $range);
+        if (!count($rows)) {
+            return [];
+        }
+        return $this->normaliseRowWidths($rows, 2);
+    }
+
+    /**
      * @param array<int, array<int, string>> $rows
      * @return array<int, array<int, string>>
      */
