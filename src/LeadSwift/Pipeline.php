@@ -311,33 +311,18 @@ class Pipeline {
     public function maybeCreateCampaignForToday(array $cityRows): ?string
     {
         $today = (new \DateTimeImmutable('today'))->format('d-m-Y');
-        $created = $this->getCampaignCreationMap();
-        $existingId = isset($created[$today]) ? trim((string)$created[$today]) : '';
-        if ($existingId !== '') {
+        $lastCreated = trim((string)($this->config['last_campaign_create_date'] ?? ''));
+        if ($lastCreated === $today) {
             $this->logger->info(sprintf(
-                'Campaign for today (%s) already exists: %s',
-                $today,
-                $existingId
-            ));
-            $this->ensureCampaignTracked($existingId);
-            return null;
-        }
-
-        $pendingQueue = array_map('strval', $this->config['campaigns_queued'] ?? []);
-        $pendingUnexported = array_map('strval', $this->config['campaigns_unexported'] ?? []);
-        $pending = array_values(array_filter(array_unique(array_merge($pendingQueue, $pendingUnexported)), fn($id) => trim((string)$id) !== ''));
-        if (count($pending)) {
-            $this->logger->info(sprintf(
-                'Pending campaigns detected (queued/unexported=%s) — skipping new campaign creation this run',
-                json_encode($pending)
+                'Campaign for today (%s) already created earlier — skipping creation',
+                $today
             ));
             return null;
         }
 
         $campaignId = $this->createCampaignAndSeedSearches($cityRows);
         if ($campaignId !== null) {
-            $created[$today] = $campaignId;
-            $this->setCampaignCreationMap($created);
+            $this->config['last_campaign_create_date'] = $today;
         }
         return $campaignId;
     }
@@ -420,46 +405,6 @@ class Pipeline {
         }
     }
 
-    private function getCampaignCreationMap(): array
-    {
-        $map = $this->config['campaigns_created_on'] ?? [];
-        if (!is_array($map)) {
-            $map = [];
-        }
-        return $map;
-    }
-
-    private function setCampaignCreationMap(array $map): void
-    {
-        $this->config['campaigns_created_on'] = $map;
-    }
-
-    private function removeExportedCampaignsFromCreationMap(array $exportedIds): void
-    {
-        if (!count($exportedIds)) return;
-        $map = $this->getCampaignCreationMap();
-        if (!count($map)) return;
-
-        $exportedIds = array_map('strval', $exportedIds);
-        $changed = false;
-        foreach ($map as $date => $campId) {
-            $campIdStr = trim((string)$campId);
-            if ($campIdStr === '') continue;
-            if (in_array($campIdStr, $exportedIds, true)) {
-                unset($map[$date]);
-                $this->logger->info(sprintf(
-                    'Cleared daily campaign marker %s for campaign %s',
-                    $date,
-                    $campIdStr
-                ));
-                $changed = true;
-            }
-        }
-        if ($changed) {
-            $this->setCampaignCreationMap($map);
-        }
-    }
-
     public function runDaily(bool $noProgress = false): array {
         $this->logger->info("Starting daily run");
         // Discover campaigns by keyword and update queues
@@ -484,7 +429,6 @@ class Pipeline {
                 if (!in_array($id, $exported, true)) $exported[] = $id;
             }
             $this->config['campaigns_exported_all'] = array_values($exported);
-            $this->removeExportedCampaignsFromCreationMap($processed);
 
             $this->logger->info("Daily run finished: RAW=" . count($downloaded['downloaded']) . "; EXPORTED_IDS=" . json_encode($downloaded['exported_ids']));
             return $downloaded;
