@@ -384,9 +384,6 @@ class Pipeline {
         $campaignId = $this->createCampaignAndSeedSearches($cityRows, $target);
         if ($campaignId !== null) {
             $this->setLastCampaignCreationDate($target);
-            if ($lastKeyUsed === 'last_campaign_create_date') {
-                unset($this->config['last_campaign_create_date']);
-            }
         }
         return $campaignId;
     }
