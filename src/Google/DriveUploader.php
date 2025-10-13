@@ -65,6 +65,7 @@ class DriveUploader {
         if (!is_readable($path)) return null;
         $content = file_get_contents($path);
         $name = $remotePath ?? basename($path);
+        $parentId = null;
         if ($remotePath !== null) {
             $normalized = str_replace('\\', '/', $remotePath);
             $normalized = trim($normalized, '/');
@@ -76,9 +77,33 @@ class DriveUploader {
                 if (count($segments) > 0) {
                     $name = array_pop($segments);
                     $parentId = $this->ensureFolderChain($segments, null);
-                    return $this->uploadFile($name, $content, $mime, $parentId);
                 }
             }
+        }
+        if ($parentId !== null) {
+            $existingId = $this->findFile($name, $parentId);
+            if ($existingId !== null) {
+                $fileMetadata = new \Google\Service\Drive\DriveFile(['name' => $name, 'parents' => [$parentId]]);
+                $updated = $this->drive->files->update($existingId, $fileMetadata, [
+                    'data' => $content,
+                    'mimeType' => $mime,
+                    'uploadType' => 'multipart',
+                    'fields' => 'id'
+                ]);
+                return $updated->id;
+            }
+            return $this->uploadFile($name, $content, $mime, $parentId);
+        }
+        $existingRoot = $this->findFile($name, null);
+        if ($existingRoot !== null) {
+            $fileMetadata = new \Google\Service\Drive\DriveFile(['name' => $name]);
+            $updated = $this->drive->files->update($existingRoot, $fileMetadata, [
+                'data' => $content,
+                'mimeType' => $mime,
+                'uploadType' => 'multipart',
+                'fields' => 'id'
+            ]);
+            return $updated->id;
         }
         return $this->uploadFile($name, $content, $mime);
     }
@@ -214,6 +239,26 @@ class DriveUploader {
     {
         $safeName = str_replace("'", "\\'", $name);
         $query = "mimeType = 'application/vnd.google-apps.folder' and trashed = false and name = '{$safeName}'";
+        if ($parentId !== null) {
+            $query .= " and '{$parentId}' in parents";
+        } else {
+            $query .= " and 'root' in parents";
+        }
+        $list = $this->drive->files->listFiles([
+            'q' => $query,
+            'spaces' => 'drive',
+            'fields' => 'files(id,name)',
+            'pageSize' => 1,
+        ]);
+        $files = $list->getFiles();
+        if (!$files) return null;
+        return $files[0]->getId();
+    }
+
+    private function findFile(string $name, ?string $parentId = null): ?string
+    {
+        $safeName = str_replace("'", "\\'", $name);
+        $query = "mimeType != 'application/vnd.google-apps.folder' and trashed = false and name = '{$safeName}'";
         if ($parentId !== null) {
             $query .= " and '{$parentId}' in parents";
         } else {

@@ -3,6 +3,7 @@ namespace App\LeadSwift;
 
 use App\LeadSwift\Utils;
 use App\LeadSwift\Logger;
+use DateTimeZone;
 
 class Pipeline {
     private array $config;
@@ -11,6 +12,7 @@ class Pipeline {
     private string $lockFile;
     private bool $lockHeld = false;
     private Logger $logger;
+    private DateTimeZone $timezone;
 
     public function __construct(array $config, string $baseDir)
     {
@@ -22,6 +24,7 @@ class Pipeline {
         $this->pruneOldLogs($logDir, (int)($this->config['log_retention_days'] ?? 3));
         $this->logFile = $logDir . '/lead_swift_' . date('Y-m-d_H-i-s') . '.log';
         $this->logger = new Logger($this->logFile, $this->config['log_level'] ?? 'INFO');
+        $this->timezone = $this->initTimezone($this->config['timezone'] ?? null);
         register_shutdown_function(function () {
             $this->releaseLock();
         });
@@ -173,10 +176,18 @@ class Pipeline {
                 $quota
             ));
 
-            if ($totalCount >= $quota) {
+            if ($totalCount >= $quota && $readyCount >= $quota) {
                 $ready[] = $campId;
             } else {
                 $stillQueued[] = $campId;
+                if ($totalCount >= $quota && $readyCount < $quota) {
+                    $this->logger->info(sprintf(
+                        'Campaign %s has %d searches but only %d ready — waiting',
+                        $campId,
+                        $totalCount,
+                        $readyCount
+                    ));
+                }
             }
         }
 
@@ -206,7 +217,7 @@ class Pipeline {
         return $all;
     }
 
-    public function createCampaignAndSeedSearches(array $cityRows): ?string
+    public function createCampaignAndSeedSearches(array $cityRows, ?\DateTimeImmutable $targetDate = null): ?string
     {
         $apiKey = trim((string)($this->config['api_key'] ?? ''));
         $campaignKeyword = trim((string)($this->config['campaign_keyword'] ?? ''));
@@ -217,8 +228,20 @@ class Pipeline {
             return null;
         }
 
-        $today = (new \DateTimeImmutable('today'))->format('d/m/Y');
+        $targetDate = ($targetDate ?? new \DateTimeImmutable('today', $this->getTimezone()))->setTime(0, 0);
+        $todayDate = (new \DateTimeImmutable('today', $this->getTimezone()))->setTime(0, 0);
+        $targetDateString = $targetDate->format('Y-m-d');
+        $todayDateString = $todayDate->format('Y-m-d');
+        if ($targetDateString > $todayDateString) {
+            $this->logger->warn(sprintf(
+                'Target date %s is in the future — campaign creation skipped',
+                $targetDate->format('d/m/Y')
+            ));
+            return null;
+        }
+        $targetFormatted = $targetDate->format('d/m/Y');
         $locations = [];
+        $futureDateAhead = null;
         foreach ($cityRows as $row) {
             if (!is_array($row)) continue;
             $location = isset($row[0]) ? trim((string)$row[0]) : '';
@@ -226,22 +249,45 @@ class Pipeline {
             if ($location === '' || $dateValue === '') continue;
             $parsed = CitySchedule::parseDateString($dateValue);
             if ($parsed === null) continue;
-            if ($parsed->format('d/m/Y') !== $today) continue;
+            $parsed = $parsed->setTimezone($this->getTimezone())->setTime(0, 0);
+            if ($parsed > $targetDate) {
+                if ($futureDateAhead === null || $parsed < $futureDateAhead) {
+                    $futureDateAhead = $parsed;
+                }
+                continue;
+            }
+            if ($parsed < $targetDate) {
+                continue;
+            }
+            $formatted = $parsed->format('d/m/Y');
+            if ($formatted !== $targetFormatted) {
+                $this->logger->warn(sprintf(
+                    'Unexpected date format mismatch (%s vs %s) — skipping row',
+                    $formatted,
+                    $targetFormatted
+                ));
+                continue;
+            }
             $locations[] = $location;
             if (count($locations) >= $quota) break;
         }
 
-        if (!count($locations)) {
-            $this->logger->info('No city rows available for today — campaign creation skipped');
-            return null;
-        }
-
         if (count($locations) < $quota) {
-            $this->logger->warn(sprintf(
-                'Only %d city rows available for today (quota=%d) — submitting fewer searches',
-                count($locations),
-                $quota
-            ));
+            if ($futureDateAhead !== null && count($locations) === 0) {
+                $this->logger->info(sprintf(
+                    'Next available city date is %s (> %s) — skipping campaign creation until schedule catches up',
+                    $futureDateAhead->format('d/m/Y'),
+                    $targetFormatted
+                ));
+            } else {
+                $this->logger->warn(sprintf(
+                    'Campaign creation skipped — only %d city rows available for %s (quota=%d)',
+                    count($locations),
+                    $targetFormatted,
+                    $quota
+                ));
+            }
+            return null;
         }
 
         try {
@@ -310,19 +356,37 @@ class Pipeline {
 
     public function maybeCreateCampaignForToday(array $cityRows): ?string
     {
-        $today = (new \DateTimeImmutable('today'))->format('d-m-Y');
-        $lastCreated = trim((string)($this->config['last_campaign_create_date'] ?? ''));
-        if ($lastCreated === $today) {
+        [$lastDate, $lastKeyUsed] = $this->getLastCampaignCreationDate();
+        $today = (new \DateTimeImmutable('today', $this->getTimezone()))->setTime(0, 0);
+        $target = $lastDate ? $lastDate->add(new \DateInterval('P1D')) : $today;
+
+        $target = $target->setTime(0, 0);
+        $targetDateString = $target->format('Y-m-d');
+        $todayDateString = $today->format('Y-m-d');
+
+        if ($targetDateString > $todayDateString) {
             $this->logger->info(sprintf(
-                'Campaign for today (%s) already created earlier — skipping creation',
-                $today
+                'Last campaign was for %s; next target %s is in the future — skipping creation',
+                $lastDate ? $lastDate->format('d-m-Y') : 'unknown',
+                $target->format('d-m-Y')
             ));
             return null;
         }
 
-        $campaignId = $this->createCampaignAndSeedSearches($cityRows);
+        if ($lastDate && $lastDate->format('Y-m-d') === $todayDateString) {
+            $this->logger->info(sprintf(
+                'Campaign for today (%s) already created earlier — skipping creation',
+                $today->format('d-m-Y')
+            ));
+            return null;
+        }
+
+        $campaignId = $this->createCampaignAndSeedSearches($cityRows, $target);
         if ($campaignId !== null) {
-            $this->config['last_campaign_create_date'] = $today;
+            $this->setLastCampaignCreationDate($target);
+            if ($lastKeyUsed === 'last_campaign_create_date') {
+                unset($this->config['last_campaign_create_date']);
+            }
         }
         return $campaignId;
     }
@@ -403,6 +467,66 @@ class Pipeline {
             $queued[] = $campaignId;
             $this->config['campaigns_queued'] = $queued;
         }
+    }
+
+    /**
+     * @return array{0: ?\DateTimeImmutable, 1: string|null}
+     */
+    private function getLastCampaignCreationDate(): array
+    {
+        $keys = ['last_campaign_create_date', 'last_campaign_creation_date'];
+        foreach ($keys as $key) {
+            $raw = trim((string)($this->config[$key] ?? ''));
+            if ($raw === '') continue;
+            $dt = $this->parseConfigDate($raw);
+            if ($dt !== null) {
+                return [$dt->setTime(0, 0), $key];
+            }
+        }
+        return [null, null];
+    }
+
+    private function setLastCampaignCreationDate(\DateTimeImmutable $date): void
+    {
+        $this->config['last_campaign_create_date'] = $date->format('d-m-Y');
+    }
+
+    private function parseConfigDate(string $raw): ?\DateTimeImmutable
+    {
+        $tz = $this->getTimezone();
+        $formats = ['d-m-Y', 'd/m/Y'];
+        foreach ($formats as $fmt) {
+            $dt = \DateTimeImmutable::createFromFormat($fmt, $raw, $tz);
+            if ($dt !== false) {
+                return $dt;
+            }
+        }
+
+        $normalised = str_replace('/', '-', $raw);
+        $dt = \DateTimeImmutable::createFromFormat('d-m-Y', $normalised, $tz);
+        return $dt !== false ? $dt : null;
+    }
+
+    private function initTimezone(?string $timezone): DateTimeZone
+    {
+        $fallback = @date_default_timezone_get() ?: 'UTC';
+        if (is_string($timezone) && $timezone !== '') {
+            try {
+                return new DateTimeZone($timezone);
+            } catch (\Throwable $e) {
+                $this->logger->warn(sprintf(
+                    'Invalid timezone "%s" in config — falling back to %s',
+                    $timezone,
+                    $fallback
+                ));
+            }
+        }
+        return new DateTimeZone($fallback);
+    }
+
+    private function getTimezone(): DateTimeZone
+    {
+        return $this->timezone;
     }
 
     public function runDaily(bool $noProgress = false): array {
