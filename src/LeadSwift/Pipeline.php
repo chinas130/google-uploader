@@ -574,10 +574,31 @@ class Pipeline {
             // 1) GET searches of campaign
             $searchesUrl = "https://leadswift.com/api/searches/{$campId}?api_key=" . urlencode($this->config['api_key'] ?? '');
             $this->logger->debug("Fetching searches: {$searchesUrl}");
-            $resp = Utils::httpGet($searchesUrl);
+            try {
+                $resp = Utils::httpGet($searchesUrl);
+            } catch (\Throwable $e) {
+                $this->logger->error(sprintf(
+                    'Failed to fetch searches for campaign %s: %s',
+                    $campId,
+                    $e->getMessage()
+                ));
+                continue;
+            }
+
             $json = json_decode($resp, true);
+            if ($json === null && json_last_error() !== JSON_ERROR_NONE) {
+                $this->logger->warn(sprintf(
+                    'Search listing returned invalid JSON for campaign %s',
+                    $campId
+                ));
+                continue;
+            }
+
             $searches = $json['data'] ?? $json;
-            if (!is_array($searches) || !count($searches)) continue;
+            if (!is_array($searches) || !count($searches)) {
+                $this->logger->info(sprintf('No searches found for campaign %s', $campId));
+                continue;
+            }
 
             $total = count($searches);
             $pad = max(2, strlen((string)$total));
@@ -596,21 +617,65 @@ class Pipeline {
                 $postData = ($this->config['export_csv_params'] ?? '') . "&page=0&total_pages=9999&search_id=" . $searchId;
 
                 $this->logger->info("BEGIN export campaign={$campId} search_id={$searchId}");
-                $beginResp = Utils::httpPostRaw($beginUrl, $postData);
+                try {
+                    $beginResp = Utils::httpPostRaw($beginUrl, $postData);
+                } catch (\Throwable $e) {
+                    $this->logger->warn(sprintf(
+                        'Export begin failed for campaign=%s search=%s: %s',
+                        $campId,
+                        $searchId,
+                        $e->getMessage()
+                    ));
+                    continue;
+                }
+
                 $bj = json_decode($beginResp, true);
+                if ($bj === null && json_last_error() !== JSON_ERROR_NONE) {
+                    $this->logger->warn(sprintf(
+                        'Export begin returned invalid JSON for campaign=%s search=%s',
+                        $campId,
+                        $searchId
+                    ));
+                    continue;
+                }
+
                 $cronId = $bj['data'] ?? null;
-                if (!$cronId) continue;
+                if (!$cronId) {
+                    $this->logger->warn(sprintf(
+                        'Export begin response missing cron_id for campaign=%s search=%s',
+                        $campId,
+                        $searchId
+                    ));
+                    continue;
+                }
 
                 // poll status
                 $statusUrl = "https://leadswift.com/api/export_leads_status?api_key=" . urlencode($this->config['api_key'] ?? '');
                 $downloadUrl = null;
-                $tries = 240; $sleep = 5;
+                $tries = max(1, (int)($this->config['export_status_max_polls'] ?? 240));
+                $sleep = max(1, (int)($this->config['export_status_poll_sleep'] ?? 5));
                 $lastPctLogged = -5;
                 $lastPageLogged = -1;
                 $startTs = microtime(true);
 
                 for ($i=1; $i<=$tries; $i++) {
-                    $stResp = Utils::httpPostForm($statusUrl, ['cron_id' => $cronId]);
+                    try {
+                        $stResp = Utils::httpPostForm($statusUrl, ['cron_id' => $cronId]);
+                    } catch (\Throwable $e) {
+                        $this->logger->warn(sprintf(
+                            'Export status failed for cron_id=%s (campaign=%s search=%s): %s',
+                            $cronId,
+                            $campId,
+                            $searchId,
+                            $e->getMessage()
+                        ));
+                        $stResp = null;
+                    }
+
+                    if ($stResp === null) {
+                        sleep($sleep);
+                        continue;
+                    }
                     $sj = json_decode($stResp, true);
                     if ($sj === null && json_last_error() !== JSON_ERROR_NONE) {
                         $data = $stResp;
@@ -652,12 +717,44 @@ class Pipeline {
                 }
                 if (!$noProgress && (PHP_SAPI === 'cli')) echo "\n";
 
-                if (!$downloadUrl) continue;
+                if (!$downloadUrl) {
+                    $totalWait = $tries * $sleep;
+                    $this->logger->warn(sprintf(
+                        'Export for campaign=%s search=%s (cron_id=%s) did not produce a download after %d polls (~%d seconds)',
+                        $campId,
+                        $searchId,
+                        $cronId,
+                        $tries,
+                        $totalWait
+                    ));
+                    continue;
+                }
 
                 // download CSV
                 $this->logger->info("Downloading -> {$destPath}");
-                $csv = Utils::httpGet($downloadUrl);
-                file_put_contents($destPath, $csv);
+                try {
+                    $csv = Utils::httpGet($downloadUrl);
+                } catch (\Throwable $e) {
+                    $this->logger->warn(sprintf(
+                        'Download failed for campaign=%s search=%s url=%s: %s',
+                        $campId,
+                        $searchId,
+                        $downloadUrl,
+                        $e->getMessage()
+                    ));
+                    continue;
+                }
+
+                $bytes = @file_put_contents($destPath, $csv);
+                if ($bytes === false) {
+                    $this->logger->warn(sprintf(
+                        'Unable to write CSV for campaign=%s search=%s to %s',
+                        $campId,
+                        $searchId,
+                        $destPath
+                    ));
+                    continue;
+                }
                 $campaignDownloaded[] = $destPath;
                 $downloaded[] = $destPath;
             }
