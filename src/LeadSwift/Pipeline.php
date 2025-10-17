@@ -913,9 +913,10 @@ class Pipeline {
         }
 
         $map = array_change_key_case(array_flip($header), CASE_LOWER);
-        $idxCompany = $map['company'] ?? $map['company_name'] ?? $map['business_name'] ?? $map['organization'] ?? $map['org'] ?? $map['name'] ?? -1;
-        $idxEmail   = $map['email'] ?? $map['email_address'] ?? $map['contact_email'] ?? $map['primary_email'] ?? -1;
-        $idxPhone   = $map['phone'] ?? $map['phone_number'] ?? $map['contact_phone'] ?? $map['primary_phone'] ?? $map['telephone'] ?? $map['mobile'] ?? -1;
+        $idxCompany  = $map['company'] ?? $map['company_name'] ?? $map['business_name'] ?? $map['organization'] ?? $map['org'] ?? $map['name'] ?? -1;
+        $idxEmail    = $map['email'] ?? $map['email_address'] ?? $map['contact_email'] ?? $map['primary_email'] ?? -1;
+        $idxPhone    = $map['phone'] ?? $map['phone_number'] ?? $map['contact_phone'] ?? $map['primary_phone'] ?? $map['telephone'] ?? $map['mobile'] ?? -1;
+        $idxCategory = $map['category'] ?? -1;
 
         $byCompany = [];
         while (($row = fgetcsv($in)) !== false) {
@@ -923,9 +924,25 @@ class Pipeline {
             if ($company === '') $company = 'UNKNOWN';
             $email = $idxEmail >= 0 ? trim((string)($row[$idxEmail] ?? '')) : '';
             $phone = $idxPhone >= 0 ? trim((string)($row[$idxPhone] ?? '')) : '';
-            if (!isset($byCompany[$company])) $byCompany[$company] = ['phone'=>'','emails'=>[], 'seen'=>[]];
+            $category = $idxCategory >= 0 ? trim((string)($row[$idxCategory] ?? '')) : '';
+            if (!isset($byCompany[$company])) {
+                $byCompany[$company] = [
+                    'phone' => '',
+                    'emails' => [],
+                    'seen' => [],
+                    'categories' => [],
+                    'categorySeen' => [],
+                ];
+            }
             if ($byCompany[$company]['phone'] === '' && $phone !== '') {
                 $byCompany[$company]['phone'] = preg_replace('/[^+0-9]/','',$phone);
+            }
+            if ($category !== '') {
+                $catKey = strtolower($category);
+                if (!isset($byCompany[$company]['categorySeen'][$catKey])) {
+                    $byCompany[$company]['categorySeen'][$catKey] = true;
+                    $byCompany[$company]['categories'][] = $category;
+                }
             }
             if ($email !== '') {
                 $k = strtolower($email);
@@ -937,12 +954,16 @@ class Pipeline {
         }
         fclose($in);
 
-        fputcsv($out, ['Company','Contact Label','Email','Phone']);
+        fputcsv($out, ['Company','Contact Label','Email','Phone','Category']);
         foreach ($byCompany as $company => $info) {
             if (empty($info['emails'])) continue;
+            $categoryStr = '';
+            if (!empty($info['categories'])) {
+                $categoryStr = implode('; ', $info['categories']);
+            }
             foreach ($info['emails'] as $i => $email) {
                 $label = 'contact ' . ($i + 1);
-                fputcsv($out, [$company, $label, $email, $info['phone']]);
+                fputcsv($out, [$company, $label, $email, $info['phone'], $categoryStr]);
             }
         }
         fclose($out);
