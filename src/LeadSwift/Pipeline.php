@@ -652,13 +652,12 @@ class Pipeline {
                 // poll status
                 $statusUrl = "https://leadswift.com/api/export_leads_status?api_key=" . urlencode($this->config['api_key'] ?? '');
                 $downloadUrl = null;
-                $tries = max(1, (int)($this->config['export_status_max_polls'] ?? 240));
                 $sleep = max(1, (int)($this->config['export_status_poll_sleep'] ?? 5));
                 $lastPctLogged = -5;
                 $lastPageLogged = -1;
                 $startTs = microtime(true);
 
-                for ($i=1; $i<=$tries; $i++) {
+                while (true) {
                     try {
                         $stResp = Utils::httpPostForm($statusUrl, ['cron_id' => $cronId]);
                     } catch (\Throwable $e) {
@@ -716,19 +715,6 @@ class Pipeline {
                     sleep($sleep);
                 }
                 if (!$noProgress && (PHP_SAPI === 'cli')) echo "\n";
-
-                if (!$downloadUrl) {
-                    $totalWait = $tries * $sleep;
-                    $this->logger->warn(sprintf(
-                        'Export for campaign=%s search=%s (cron_id=%s) did not produce a download after %d polls (~%d seconds)',
-                        $campId,
-                        $searchId,
-                        $cronId,
-                        $tries,
-                        $totalWait
-                    ));
-                    continue;
-                }
 
                 // download CSV
                 $this->logger->info("Downloading -> {$destPath}");
