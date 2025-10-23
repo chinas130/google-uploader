@@ -531,6 +531,9 @@ class Pipeline {
         // Discover campaigns by keyword and update queues
         $this->syncCampaignQueues();
 
+        // Ensure previous exports actually produced files; requeue broken ones
+        $this->reconcilePreviousExports();
+
         $this->acquireLock();
 
         try {
@@ -767,6 +770,52 @@ class Pipeline {
             $this->logger->info("Campaign processed: {$campId}");
         }
         return ['downloaded' => $downloaded, 'exported_ids' => $exportedIds];
+    }
+
+    private function reconcilePreviousExports(): void {
+        $exported = array_map('strval', $this->config['campaigns_exported_all'] ?? []);
+        if (!count($exported)) return;
+
+        $rawBase = $this->baseDir . '/LeadSwift_RAW';
+        $mergedBase = $this->baseDir . '/LeadSwift_MERGED';
+        $preparedBase = $this->baseDir . '/LeadSwift_PREPARED';
+
+        $needsRepair = [];
+        foreach ($exported as $campId) {
+            $rawOk = $this->directoryHasCsv($rawBase . "/campaign_{$campId}");
+            $mergedOk = $this->directoryHasCsv($mergedBase . "/campaign_{$campId}");
+            $preparedOk = $this->directoryHasCsv($preparedBase . "/campaign_{$campId}");
+
+            if (!$rawOk || !$mergedOk || !$preparedOk) {
+                $needsRepair[] = $campId;
+                $this->logger->warn(sprintf(
+                    'Campaign %s marked exported but missing files (RAW:%s MERGED:%s PREPARED:%s) — requeuing',
+                    $campId,
+                    $rawOk ? 'ok' : 'missing',
+                    $mergedOk ? 'ok' : 'missing',
+                    $preparedOk ? 'ok' : 'missing'
+                ));
+            }
+        }
+
+        if (!count($needsRepair)) return;
+
+        $this->config['campaigns_exported_all'] = array_values(array_diff($exported, $needsRepair));
+
+        foreach ($needsRepair as $campId) {
+            $this->ensureCampaignTracked($campId);
+            $unexported = $this->config['campaigns_unexported'] ?? [];
+            if (!in_array($campId, $unexported, true)) {
+                $unexported[] = $campId;
+                $this->config['campaigns_unexported'] = $unexported;
+            }
+        }
+    }
+
+    private function directoryHasCsv(string $dir): bool {
+        if (!is_dir($dir)) return false;
+        $csv = glob(rtrim($dir, DIRECTORY_SEPARATOR) . '/*.csv');
+        return $csv && count($csv) > 0;
     }
 
     private function fetchCampaignSearchStats(string $campaignId): array {
