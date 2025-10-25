@@ -564,7 +564,9 @@ class Pipeline {
     private function processCampaigns(array $campaignIds, bool $noProgress): array {
         $downloaded = [];
         $exportedIds = [];
+        $accountBusy = false;
         foreach ($campaignIds as $campId) {
+            if ($accountBusy) break;
             // ensure campaignId is valid int/string
             if (empty($campId)) continue;
             $rawDir      = $this->baseDir . "/LeadSwift_RAW/campaign_{$campId}";
@@ -608,6 +610,7 @@ class Pipeline {
             $seq = 1;
 
             foreach ($searches as $s) {
+                if ($accountBusy) break;
                 $searchId = $s['id'] ?? $s['search_id'] ?? null;
                 do {
                     $fileName = sprintf("search_%0{$pad}d.csv", $seq);
@@ -623,11 +626,23 @@ class Pipeline {
                 try {
                     $beginResp = Utils::httpPostRaw($beginUrl, $postData);
                 } catch (\Throwable $e) {
+                    $message = $e->getMessage();
+                    if ($this->isExportAccountBusyMessage($message)) {
+                        $this->logger->warn(sprintf(
+                            'Export begin blocked for campaign=%s search=%s: account has another export running',
+                            $campId,
+                            $searchId
+                        ));
+                        $this->ensureCampaignTracked($campId);
+                        $this->logger->info('Deferring remaining exports until current LeadSwift export completes');
+                        $accountBusy = true;
+                        break;
+                    }
                     $this->logger->warn(sprintf(
                         'Export begin failed for campaign=%s search=%s: %s',
                         $campId,
                         $searchId,
-                        $e->getMessage()
+                        $message
                     ));
                     continue;
                 }
@@ -770,6 +785,15 @@ class Pipeline {
             $this->logger->info("Campaign processed: {$campId}");
         }
         return ['downloaded' => $downloaded, 'exported_ids' => $exportedIds];
+    }
+
+    private function isExportAccountBusyMessage(?string $message): bool
+    {
+        if ($message === null) return false;
+        $msg = strtolower($message);
+        return strpos($msg, 'already an export running') !== false
+            || strpos($msg, 'already running an export') !== false
+            || strpos($msg, 'export running on your account') !== false;
     }
 
     private function reconcilePreviousExports(): void {
