@@ -2,6 +2,13 @@
 
 This repository contains a refactored LeadSwift export pipeline and a Google Drive/Sheets uploader.
 
+## Status
+
+This is legacy code from the `openai-worker` project and is provided as-is.
+Active maintenance is not guaranteed.
+
+Do not commit credentials or runtime artifacts to git. In particular, keep files such as `config.json`, `.env`, `client_secret.json`, `token.json`, logs, lock files, and generated CSV exports out of the repository.
+
 - `src/LeadSwift/Pipeline.php` — orchestration of the daily export, campaign discovery/queueing, and CSV preparation.
 - `src/LeadSwift/Utils.php` — helpers (HTTP, progress detection/printing, atomic write).
 - `src/LeadSwift/Logger.php` — simple logger that writes to stdout and a log file.
